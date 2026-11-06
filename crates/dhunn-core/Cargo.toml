@@ -1,0 +1,9 @@
+[package]
+name = "dhunn-core"
+description = "Shared types for the dhunn recommendation engine"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true

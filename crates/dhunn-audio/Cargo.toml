@@ -1,0 +1,11 @@
+[package]
+name = "dhunn-audio"
+description = "Audio decoding, downmixing and resampling for dhunn"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+rubato.workspace = true
+symphonia.workspace = true
+thiserror.workspace = true

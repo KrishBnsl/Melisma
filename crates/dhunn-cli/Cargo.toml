@@ -1,0 +1,19 @@
+[package]
+name = "dhunn-cli"
+description = "The `dhunn` command-line tool"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "dhunn"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+dhunn-audio.workspace = true
+dhunn-core.workspace = true
+dhunn-dsp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
