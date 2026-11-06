@@ -1,5 +1,7 @@
 //! `dhunn` — command-line front end for the dhunn recommendation engine.
 
+mod library;
+
 use std::{
     path::{Path, PathBuf},
     time::Instant,
@@ -18,6 +20,10 @@ use serde::Serialize;
     about = "Music recommendation engine that listens to the music"
 )]
 struct Cli {
+    /// Library database file. Defaults to the platform data directory
+    /// (macOS: ~/Library/Application Support/dhunn/dhunn.db).
+    #[arg(long, global = true, env = "DHUNN_DB")]
+    db: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -41,6 +47,26 @@ enum Command {
         #[arg(long, hide = true)]
         validation: bool,
     },
+    /// Scan a music folder and analyze new or changed tracks into the library.
+    Analyze {
+        /// Folder to scan recursively.
+        dir: PathBuf,
+        /// Re-analyze every file, even unchanged ones.
+        #[arg(long)]
+        force: bool,
+        /// Tracks analyzed in parallel [default: half the CPU cores, max 6].
+        #[arg(short, long)]
+        jobs: Option<usize>,
+        /// Only print the summary, not one line per file.
+        #[arg(short, long)]
+        quiet: bool,
+    },
+    /// Show what is in the library.
+    Stats {
+        /// How many recent failures to list.
+        #[arg(long, default_value_t = 10)]
+        failures: usize,
+    },
 }
 
 #[derive(Serialize)]
@@ -56,7 +82,16 @@ struct InspectOutput<'a> {
 }
 
 fn main() -> Result<()> {
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    let db = cli.db.clone();
+    match cli.command {
+        Command::Analyze {
+            dir,
+            force,
+            jobs,
+            quiet,
+        } => library::analyze(&library::db_path(db)?, &dir, force, jobs, quiet),
+        Command::Stats { failures } => library::stats(&library::db_path(db)?, failures),
         Command::Inspect {
             path,
             json,

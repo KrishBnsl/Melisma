@@ -1,0 +1,22 @@
+[package]
+name = "dhunn-analysis"
+description = "Scans a music folder and analyzes new or changed tracks into the store"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+dhunn-audio.workspace = true
+dhunn-core.workspace = true
+dhunn-dsp.workspace = true
+dhunn-meta.workspace = true
+dhunn-store.workspace = true
+rayon.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+walkdir.workspace = true
+xxhash-rust.workspace = true
+
+[dev-dependencies]
+hound.workspace = true
+tempfile.workspace = true

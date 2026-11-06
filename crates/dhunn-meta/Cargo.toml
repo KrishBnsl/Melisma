@@ -1,0 +1,10 @@
+[package]
+name = "dhunn-meta"
+description = "Track metadata: tag reading (later: MusicBrainz / ListenBrainz)"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+dhunn-core.workspace = true
+lofty.workspace = true

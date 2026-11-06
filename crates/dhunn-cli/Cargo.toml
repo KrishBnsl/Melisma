@@ -12,8 +12,11 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+dhunn-analysis.workspace = true
 dhunn-audio.workspace = true
 dhunn-core.workspace = true
 dhunn-dsp.workspace = true
+dhunn-store.workspace = true
+dirs.workspace = true
 serde.workspace = true
 serde_json.workspace = true

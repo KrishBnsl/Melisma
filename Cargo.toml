@@ -11,16 +11,26 @@ publish = false
 dhunn-core = { path = "crates/dhunn-core" }
 dhunn-audio = { path = "crates/dhunn-audio" }
 dhunn-dsp = { path = "crates/dhunn-dsp" }
+dhunn-store = { path = "crates/dhunn-store" }
+dhunn-meta = { path = "crates/dhunn-meta" }
+dhunn-analysis = { path = "crates/dhunn-analysis" }
 
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
+dirs = "7"
+hound = "3.5"
+lofty = "0.25"
 rayon = "1"
 realfft = "3"
 rubato = "0.16"
+rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 symphonia = { version = "0.5.5", features = ["all"] }
+tempfile = "3"
 thiserror = "2"
+walkdir = "2.5"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [profile.release]
 debug = 1

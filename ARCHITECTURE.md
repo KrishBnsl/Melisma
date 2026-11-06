@@ -32,9 +32,9 @@ dhunn/
 │   ├── dhunn-audio/           # decode + resample + framing (symphonia, rubato)
 │   ├── dhunn-dsp/             # spectral, MFCC, chroma, HPSS, onset, tempo, loudness
 │   ├── dhunn-embed/           # ONNX inference (ort): audio embedding, CLAP text/audio
-│   ├── dhunn-analysis/        # orchestrates audio→dsp→embed per track; parallel batch
+│   ├── dhunn-analysis/        # library scan: change detection, dedupe by audio hash, parallel audio→dsp(→embed)
 │   ├── dhunn-store/           # SQLite (rusqlite) for metadata, features, events
-│   ├── dhunn-meta/            # tag reading (lofty), MusicBrainz matching + artist graph, ListenBrainz similar-artists / discovery items
+│   ├── dhunn-meta/            # tag reading + artist-credit parsing (lofty) ✅; later MusicBrainz matching + artist graph, ListenBrainz similar-artists / discovery items
 │   ├── dhunn-import/          # Spotify extended history + Apple Music play activity parsers; match plays → tracks/artists
 │   ├── dhunn-index/           # vector index (exact for small, HNSW for large) + graph
 │   ├── dhunn-profile/         # long-term taste + session state
@@ -81,15 +81,27 @@ Not yet: tuning estimation for chroma, true LUFS (K-weighted) loudness, beat tra
 
 ## 4. Storage (`dhunn-store`)
 
-SQLite (single file, WAL mode). At group scale (≤500k tracks, ≤20 users) this is enough for the shared server too; backends stay behind a trait in case that changes.
+SQLite (single file, WAL mode, numbered migrations via `PRAGMA user_version`). At group scale (≤500k tracks, ≤20 users) this is enough for the shared server too.
+
+**Implemented** (migration 1):
 
 ```
-users(id, name, adventurousness, share_profile BOOL)
-tracks(id, path, content_hash, title, album, year, duration, mb_recording_id, added_by)
-artists(id, name, mb_artist_id)
-track_artists(track_id, artist_id, role)    -- primary, featured; handles multi-artist tracks
+tracks(id, content_hash UNIQUE, title, album, year, duration_s, mb_recording_id, added_at)
+track_files(path PK, track_id, size, mtime_ns)       -- many files → one track (copies, moves)
+artists(id, name, name_key UNIQUE, mb_artist_id)      -- name_key = normalized name
+track_artists(track_id, artist_id, role, position)    -- role: primary | featured
+feature_schemas(kind, version, names JSON)            -- dimension names, stored once per layout
+features(track_id, kind, version, vec BLOB f32 LE, summary JSON, computed_at)
+scan_failures(path PK, size, mtime_ns, error, failed_at)
+```
+
+A **track** is a recording identified by `content_hash` (xxh3 of its decoded samples + sample rate), so renamed, moved, re-tagged and duplicated files share one track and one analysis. Tracks survive their files being deleted (listening history refers to tracks).
+
+**Planned** (later migrations, with the steps that need them):
+
+```
+users(id, name, adventurousness, share_profile BOOL)          -- + tracks.added_by
 artist_links(a, b, kind, weight, source)     -- collab, member_of, influence, same_label, lb_similar
-features(track_id, version, dsp BLOB, scalars JSON)
 embeddings(track_id, model, version, vec BLOB)
 history_plays(id, user_id, ts, source, raw_artist, raw_title, track_id NULL, artist_id NULL,
               ms_played, skipped, reason_end)  -- imported; track_id NULL = not in library
@@ -97,6 +109,16 @@ external_items(id, mb_recording_id, mb_artist_id, title, artist, source, link)  
 events(id, ts, user_id, session_id, track_id, kind, payload JSON, schema_version)
 sessions(id, user_id, started_at, mode, vibe JSON, context JSON, private BOOL)
 ```
+
+## 4b. Library scan (`dhunn-analysis`) — *implemented*
+
+`dhunn analyze <dir>` walks the folder (following symlinks, skipping `._*` files) and, per audio file:
+1. **Unchanged** (same size + mtime, track has current `dsp` features) → skip without reading.
+2. **Failed before** and unchanged since → skip (retried once the file changes, or with `--force`).
+3. Otherwise decode and hash. **Known audio** → link the file to the existing track (a re-tagged file also refreshes the track's tags). **New audio** → resample, DSP-analyze, read tags (title falls back to the file name; artist credits parsed for "feat."/"ft."), save in one transaction.
+4. Files gone from disk are forgotten (only if the path really no longer exists — an unreadable folder is never treated as deleted).
+
+Decoding/analysis runs on a bounded worker pool (default: half the cores, max 6); all writes happen on one thread. Copies of the same audio within one scan are analyzed once. Measured on the FMP corpus (553 files, mostly 10 s–4 min): 65 s for a first scan with 4 workers, ~1 GB peak RAM; rescan 0.0 s.
 
 ## 4a. History import (`dhunn-import`)
 
@@ -182,7 +204,9 @@ Every CLI action emits an `Event` (play, skip{at_ms}, complete, replay, like, di
 
 ```
 dhunn user add <name> [--adventure 0.4]
-dhunn analyze <dir> [--added-by <user>]  # build/refresh features + embeddings
+dhunn [--db <file>] …                  # library DB; default: platform data dir, or $DHUNN_DB
+dhunn analyze <dir> [--force] [-j N] [-q] [--added-by <user>]  # scan + analyze (✅ except --added-by)
+dhunn stats                            # library totals + recent failures (✅)
 dhunn import spotify|apple <path> --user <name>   # history export → history_plays
 dhunn index                           # build index, clusters, artist graph
 dhunn mb-sync                         # optional MusicBrainz/ListenBrainz matching (rate-limited)
@@ -204,7 +228,7 @@ symphonia, rubato, realfft, ndarray, rayon, ort (ONNX Runtime), rusqlite, lofty,
 ## 14. Build order
 
 1. ✅ `core`, `audio`, `dsp` + `inspect` command — validated against librosa (`ml/validate_dsp.py`).
-2. `store`, `analysis`, `analyze` command.
+2. ✅ `store`, `meta` (tags), `analysis`, `analyze` + `stats` commands.
 3. `import` (Spotify first, then Apple) + track matching — gives real data before any algorithm work.
 4. `index` (exact) + basic `session --seed` (similarity only).
 5. `eval` on imported history + simulated users — baseline numbers.

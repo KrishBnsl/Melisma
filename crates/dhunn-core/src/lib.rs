@@ -43,3 +43,56 @@ impl FeatureVec {
             .map(|i| self.values[i])
     }
 }
+
+/// How an artist is credited on a track.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ArtistRole {
+    Primary,
+    Featured,
+}
+
+impl ArtistRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ArtistRole::Primary => "primary",
+            ArtistRole::Featured => "featured",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtistCredit {
+    pub name: String,
+    pub role: ArtistRole,
+    pub mb_artist_id: Option<String>,
+}
+
+/// Descriptive metadata for a track (from tags, later MusicBrainz).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrackMeta {
+    pub title: String,
+    pub album: Option<String>,
+    pub year: Option<i32>,
+    pub duration_s: f64,
+    pub mb_recording_id: Option<String>,
+    pub artists: Vec<ArtistCredit>,
+}
+
+/// Normalizes a name for matching: case-folded, trimmed, inner whitespace collapsed.
+pub fn normalize_name(s: &str) -> String {
+    s.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_names() {
+        assert_eq!(normalize_name("  The   Beatles "), "the beatles");
+    }
+}
