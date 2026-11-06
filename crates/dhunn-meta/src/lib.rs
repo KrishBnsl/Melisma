@@ -211,6 +211,26 @@ pub fn featured_in_title(title: &str) -> Vec<String> {
     Vec::new()
 }
 
+/// Splits an untagged file name like `"03 - Artist - Title"` or `"Artist - Title"` into
+/// `(artist, title)`, dropping a leading track number. `None` if there is no " - ".
+pub fn parse_file_name(stem: &str) -> Option<(String, String)> {
+    let mut s = stem.trim();
+    // Leading track number: "03 ", "03. ", "1-03 - ", "03 - ".
+    let digits = s
+        .find(|c: char| !(c.is_ascii_digit() || c == '-'))
+        .unwrap_or(0);
+    if digits > 0 && digits <= 5 {
+        let rest = s[digits..].trim_start_matches(['.', ' ', '_']).trim_start();
+        let rest = rest.strip_prefix("- ").unwrap_or(rest);
+        if !rest.is_empty() {
+            s = rest;
+        }
+    }
+    let (artist, title) = s.split_once(" - ")?;
+    let (artist, title) = (artist.trim(), title.trim());
+    (!artist.is_empty() && !title.is_empty()).then(|| (artist.to_owned(), title.to_owned()))
+}
+
 /// First plausible 4-digit year in a date string ("1970", "1970-05-08", "2003/01/01").
 pub fn parse_year(s: &str) -> Option<i32> {
     let b = s.as_bytes();
@@ -279,6 +299,29 @@ mod tests {
         assert_eq!(featured_in_title("Song (feat. A & B)"), vec!["A", "B"]);
         assert_eq!(featured_in_title("Song [ft. C]"), vec!["C"]);
         assert!(featured_in_title("Stand By Me with Strings").is_empty());
+    }
+
+    #[test]
+    fn file_names() {
+        let p = |s| parse_file_name(s);
+        assert_eq!(
+            p("The Beatles - Let It Be"),
+            Some(("The Beatles".into(), "Let It Be".into()))
+        );
+        assert_eq!(
+            p("03 - The Beatles - Let It Be"),
+            Some(("The Beatles".into(), "Let It Be".into()))
+        );
+        assert_eq!(
+            p("03. Nirvana - Polly"),
+            Some(("Nirvana".into(), "Polly".into()))
+        );
+        assert_eq!(
+            p("1-07 AC/DC - High Voltage"),
+            Some(("AC/DC".into(), "High Voltage".into()))
+        );
+        assert_eq!(p("FMP_C5_Audio_Beatles_LetItBe"), None);
+        assert_eq!(p("Track 01"), None);
     }
 
     #[test]

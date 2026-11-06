@@ -1,5 +1,6 @@
 //! `dhunn` — command-line front end for the dhunn recommendation engine.
 
+mod history;
 mod library;
 
 use std::{
@@ -67,6 +68,33 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         failures: usize,
     },
+    /// Manage the people who use this library.
+    User {
+        #[command(subcommand)]
+        action: history::UserAction,
+    },
+    /// Import listening history from a Spotify or Apple Music data export.
+    Import {
+        #[arg(value_enum)]
+        service: history::ServiceArg,
+        /// The unzipped export folder, or a single history file.
+        path: PathBuf,
+        #[arg(long, short)]
+        user: String,
+    },
+    /// Summarize a user's imported listening history.
+    History {
+        #[arg(long, short)]
+        user: String,
+        /// How many top artists/tracks to show.
+        #[arg(long, default_value_t = 10)]
+        top: usize,
+    },
+    /// Developer tools.
+    Dev {
+        #[command(subcommand)]
+        action: history::DevAction,
+    },
 }
 
 #[derive(Serialize)]
@@ -92,6 +120,14 @@ fn main() -> Result<()> {
             quiet,
         } => library::analyze(&library::db_path(db)?, &dir, force, jobs, quiet),
         Command::Stats { failures } => library::stats(&library::db_path(db)?, failures),
+        Command::User { action } => history::user(&library::db_path(db)?, action),
+        Command::Import {
+            service,
+            path,
+            user,
+        } => history::import(&library::db_path(db)?, service, &path, &user),
+        Command::History { user, top } => history::history(&library::db_path(db)?, &user, top),
+        Command::Dev { action } => history::dev(&library::db_path(db)?, action),
         Command::Inspect {
             path,
             json,

@@ -13,6 +13,11 @@ pub const ANALYSIS_SAMPLE_RATE: u32 = 22_050;
 #[serde(transparent)]
 pub struct TrackId(pub u64);
 
+/// Identifier of a dhunn user (a person in the friend group).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct UserId(pub u64);
+
 /// A fixed-order, versioned feature vector. `names[i]` describes `values[i]`.
 ///
 /// Vectors are only comparable when `kind` and `version` match.

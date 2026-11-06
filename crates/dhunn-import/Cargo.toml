@@ -1,0 +1,19 @@
+[package]
+name = "dhunn-import"
+description = "Import Spotify / Apple Music listening history and match it to the library"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+csv.workspace = true
+dhunn-core.workspace = true
+dhunn-meta.workspace = true
+dhunn-store.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+strsim.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

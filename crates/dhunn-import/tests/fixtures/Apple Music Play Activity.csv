@@ -1,0 +1,4 @@
+Album Name,Song Name,Artist Name,Event Start Timestamp,Event Type,Play Duration Milliseconds,Media Duration In Milliseconds,End Reason Type
+Let It Be,Let It Be,The Beatles,2026-03-03T10:00:00.123Z,PLAY_END,243000,243000,NATURAL_END_OF_TRACK
+Paranoid,Paranoid,Black Sabbath,2026-03-03T10:05:00Z,PLAY_END,9000,170000,TRACK_SKIPPED_FORWARDS
+Paranoid,Paranoid,Black Sabbath,2026-03-03T10:05:00Z,PLAY_START,0,170000,

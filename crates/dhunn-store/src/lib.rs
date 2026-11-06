@@ -14,6 +14,9 @@ use std::{
 use dhunn_core::{FeatureVec, TrackId, TrackMeta, normalize_name};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
+mod history;
+pub use history::*;
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("database error: {0}")]
@@ -22,6 +25,8 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("feature vector layout for {kind} v{version} differs from the one already stored")]
     SchemaMismatch { kind: String, version: u32 },
+    #[error("a user named {0:?} already exists")]
+    UserExists(String),
     #[error("database was created by a newer dhunn (schema {found}, this build knows {known})")]
     TooNew { found: i64, known: i64 },
 }
@@ -29,7 +34,8 @@ pub enum StoreError {
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// Ordered migrations; index + 1 is the schema version it produces.
-const MIGRATIONS: &[&str] = &[r#"
+const MIGRATIONS: &[&str] = &[
+    r#"
 CREATE TABLE tracks (
     id              INTEGER PRIMARY KEY,
     content_hash    TEXT    NOT NULL UNIQUE,
@@ -83,7 +89,38 @@ CREATE TABLE scan_failures (
     error     TEXT    NOT NULL,
     failed_at INTEGER NOT NULL
 );
-"#];
+"#,
+    r#"
+CREATE TABLE users (
+    id              INTEGER PRIMARY KEY,
+    name            TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+    adventurousness REAL    NOT NULL DEFAULT 0.5 CHECK (adventurousness BETWEEN 0 AND 1),
+    share_profile   INTEGER NOT NULL DEFAULT 1,
+    created_at      INTEGER NOT NULL
+);
+CREATE TABLE history_plays (
+    id         INTEGER PRIMARY KEY,
+    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    ts         INTEGER NOT NULL,
+    source     TEXT    NOT NULL,
+    raw_artist TEXT    NOT NULL,
+    raw_title  TEXT    NOT NULL,
+    raw_album  TEXT,
+    ms_played  INTEGER NOT NULL,
+    skipped    INTEGER,
+    reason_end TEXT,
+    shuffle    INTEGER,
+    source_uri TEXT,
+    track_id   INTEGER REFERENCES tracks(id) ON DELETE SET NULL,
+    artist_id  INTEGER REFERENCES artists(id) ON DELETE SET NULL,
+    match_kind TEXT CHECK (match_kind IN ('exact', 'fuzzy', 'artist', 'none')),
+    UNIQUE (user_id, source, ts, raw_artist, raw_title)
+);
+CREATE INDEX history_by_user_ts ON history_plays(user_id, ts);
+CREATE INDEX history_by_track ON history_plays(track_id);
+CREATE INDEX history_by_key ON history_plays(raw_artist, raw_title);
+"#,
+];
 
 /// Size and modification time of a file, used to detect changes without reading it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,7 +178,7 @@ pub struct Store {
     conn: Connection,
 }
 
-fn now_unix() -> i64 {
+pub(crate) fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)

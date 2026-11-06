@@ -17,7 +17,7 @@ pub fn db_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
     Ok(base.join("dhunn").join("dhunn.db"))
 }
 
-fn open(db: &Path) -> Result<Store> {
+pub fn open(db: &Path) -> Result<Store> {
     Store::open(db).with_context(|| format!("opening library {}", db.display()))
 }
 
@@ -107,6 +107,15 @@ pub fn analyze(db: &Path, dir: &Path, force: bool, jobs: Option<usize>, quiet: b
             String::new()
         },
     );
+    if !store.users()?.is_empty() {
+        let m = dhunn_import::match_history(&mut store)?;
+        if m.exact + m.fuzzy > 0 {
+            println!(
+                "Matched {} more listening-history entries to library tracks",
+                m.exact + m.fuzzy
+            );
+        }
+    }
     if r.analyzed > 0 {
         let secs = r.elapsed.as_secs_f64() / r.analyzed as f64;
         println!(

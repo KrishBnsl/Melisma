@@ -173,13 +173,22 @@ fn track_meta(path: &Path, duration_s: f64) -> TrackMeta {
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let (title, artists) = match (tags.title, tags.artists.is_empty()) {
+        (Some(t), _) => (t, tags.artists),
+        (None, false) => (stem, tags.artists),
+        // No title or artist tags: try an "Artist - Title" file name.
+        (None, true) => match dhunn_meta::parse_file_name(&stem) {
+            Some((artist, title)) => (title, dhunn_meta::parse_artist_credits(&artist)),
+            None => (stem, Vec::new()),
+        },
+    };
     TrackMeta {
-        title: tags.title.unwrap_or(stem),
+        title,
         album: tags.album,
         year: tags.year,
         duration_s,
         mb_recording_id: tags.mb_recording_id,
-        artists: tags.artists,
+        artists,
     }
 }
 

@@ -35,13 +35,13 @@ dhunn/
 │   ├── dhunn-analysis/        # library scan: change detection, dedupe by audio hash, parallel audio→dsp(→embed)
 │   ├── dhunn-store/           # SQLite (rusqlite) for metadata, features, events
 │   ├── dhunn-meta/            # tag reading + artist-credit parsing (lofty) ✅; later MusicBrainz matching + artist graph, ListenBrainz similar-artists / discovery items
-│   ├── dhunn-import/          # Spotify extended history + Apple Music play activity parsers; match plays → tracks/artists
+│   ├── dhunn-import/          # Spotify (extended + basic) / Apple parsers, history → library matching ✅
 │   ├── dhunn-index/           # vector index (exact for small, HNSW for large) + graph
 │   ├── dhunn-profile/         # long-term taste + session state
 │   ├── dhunn-steer/           # exploration modes, trajectory planning
 │   ├── dhunn-score/           # candidate scoring + blending weights
 │   ├── dhunn-explain/         # human-readable reasons
-│   ├── dhunn-eval/            # offline metrics, simulated users, A/B session export
+│   ├── dhunn-eval/            # simulated listeners ✅; offline metrics, A/B session export
 │   └── dhunn-cli/             # `dhunn` binary
 ├── ml/                        # Python: model export to ONNX, later fine-tuning
 ├── models/                    # .onnx files (git-ignored, fetched by script)
@@ -97,14 +97,22 @@ scan_failures(path PK, size, mtime_ns, error, failed_at)
 
 A **track** is a recording identified by `content_hash` (xxh3 of its decoded samples + sample rate), so renamed, moved, re-tagged and duplicated files share one track and one analysis. Tracks survive their files being deleted (listening history refers to tracks).
 
+**Implemented** (migration 2):
+
+```
+users(id, name UNIQUE NOCASE, adventurousness 0..1, share_profile, created_at)
+history_plays(id, user_id, ts, source, raw_artist, raw_title, raw_album, ms_played,
+              skipped NULL, reason_end, shuffle, source_uri,
+              track_id NULL, artist_id NULL, match_kind)   -- exact | fuzzy | artist | none
+              UNIQUE (user_id, source, ts, raw_artist, raw_title)  -- re-import is a no-op
+```
+
 **Planned** (later migrations, with the steps that need them):
 
 ```
-users(id, name, adventurousness, share_profile BOOL)          -- + tracks.added_by
+tracks.added_by -> users
 artist_links(a, b, kind, weight, source)     -- collab, member_of, influence, same_label, lb_similar
 embeddings(track_id, model, version, vec BLOB)
-history_plays(id, user_id, ts, source, raw_artist, raw_title, track_id NULL, artist_id NULL,
-              ms_played, skipped, reason_end)  -- imported; track_id NULL = not in library
 external_items(id, mb_recording_id, mb_artist_id, title, artist, source, link)  -- no audio
 events(id, ts, user_id, session_id, track_id, kind, payload JSON, schema_version)
 sessions(id, user_id, started_at, mode, vibe JSON, context JSON, private BOOL)
@@ -120,12 +128,17 @@ sessions(id, user_id, started_at, mode, vibe JSON, context JSON, private BOOL)
 
 Decoding/analysis runs on a bounded worker pool (default: half the cores, max 6); all writes happen on one thread. Copies of the same audio within one scan are analyzed once. Measured on the FMP corpus (553 files, mostly 10 s–4 min): 65 s for a first scan with 4 workers, ~1 GB peak RAM; rescan 0.0 s.
 
-## 4a. History import (`dhunn-import`)
+## 4a. History import (`dhunn-import`) — *implemented*
 
-- **Spotify extended streaming history** (JSON: `ts`, `ms_played`, track/artist/album names, `spotify_track_uri`, `reason_start`, `reason_end`, `skipped`, `shuffle`).
-- **Apple Music play activity** (CSV from Apple's privacy data export: track/artist, play duration, end reason).
-- **Matching:** normalize artist + title (case, punctuation, "feat.", remaster/live suffixes) → exact, then fuzzy (string similarity, plus a duration check where the export has durations — Apple does, Spotify's extended history only has `ms_played`) against library tracks; artist-level match even when the track isn't owned.
-- **Uses:** seed long-term taste (play counts, completion rate, skips with time decay); artist affinity for unowned music; "loved but not in library" suggestions; real held-out sessions for eval.
+- **Spotify extended streaming history** (`Streaming_History_Audio_*.json`): `ts` (UTC, end of play), `ms_played`, track/artist/album, `spotify_track_uri`, `reason_end`, `skipped`, `shuffle`. Podcasts/audiobooks ignored; network fields (`ip_addr`) never read.
+- **Spotify basic account data** (`StreamingHistory_music_*.json`): `endTime`, `artistName`, `trackName`, `msPlayed` — no skip flag. Arrives in days rather than weeks.
+- **Apple Music** (`Apple Music Play Activity.csv`, `Apple Music - Play History Daily Tracks.csv`): read by header name, `PLAY_END` events only; daily aggregates expanded into individual plays. *Built from the documented columns, not yet checked against a real export.*
+- **Matching** (`matcher.rs`), per distinct (artist, title): titles lose version notes ("- Remastered 2009", "(feat. X)", "[Mono]") and punctuation but keep "live"/"acoustic"/"remix"; artists lose a leading "The", "&" → "and"; every credited artist is tried. Then: **exact** → **fuzzy** (Jaro–Winkler ≥ 0.92 on title within the artist, ≥ 0.90 on artist within the title) → untagged library tracks by exact title (≥ 12 chars, so "Intro" never matches) → **artist only** → **none**. Artist-only and unmatched plays are retried after every `dhunn analyze`, so they get picked up as the library grows.
+- **Listen vs skip:** the export's `skipped` flag when present, otherwise < 30 s = skip (so a full play of a 20 s track is a listen).
+- **Untagged files** named `Artist - Title` (optionally with a track number) get artist/title from the file name at scan time.
+- **Uses (next steps):** seed long-term taste (listens, skips, recency); artist affinity for unowned music; "loved but not in library" suggestions; held-out sessions for eval.
+
+**Simulated listener** (`dhunn-eval::simulate`, `dhunn dev sample-history`): a hidden taste of N "home" tracks in z-scored DSP space; library picks weighted by affinity × similarity to the previous track (sessions drift), 12% random picks (shuffle/radio), 25% plays of popular songs not in the library, 30% of library names re-spelled the streaming-service way, skip probability rising as affinity falls. Writes Spotify-format JSON plus `dhunn_ground_truth.json` (home tracks + every track's affinity) for evaluation. Deterministic per seed. On the FMP library (120 days): 2,154 plays, 78% matched, and the most-listened tracks are the hidden home tracks.
 
 ## 5. Index (`dhunn-index`)
 
@@ -196,18 +209,20 @@ Every CLI action emits an `Event` (play, skip{at_ms}, complete, replay, like, di
 
 - **Real data first:** imported Spotify history (with `skipped`, `ms_played`, `reason_end`) restricted to tracks matched in the library gives real sessions; split by time (train on older, hold out the most recent weeks).
 - **Offline:** given those, event logs or public datasets (e.g. sessions over FMA tracks), compute hit-rate@k / NDCG@k for next-track, skip-prediction AUC, transition smoothness, novelty, diversity, long-tail coverage, repetition rate, steering reach (target reached? max hop ≤ σ?).
-- **Simulated users:** synthetic listeners with hidden taste regions + skip models, to regression-test steering before real users exist.
+- **Simulated users:** synthetic listeners with hidden taste regions + skip models (✅ implemented, see §4a), to regression-test steering before real users exist; their ground truth gives "did we recommend what they like" metrics.
 - **Listening tests:** export pairs of sessions (variant A vs B) as blind playlists; record preferences.
 - `dhunn eval --config variants.toml` prints a comparison table; every algorithm change runs it.
 
 ## 12. CLI (`dhunn-cli`, clap)
 
 ```
-dhunn user add <name> [--adventure 0.4]
+dhunn user add|list|set <name> [--adventure 0.4]   # ✅
 dhunn [--db <file>] …                  # library DB; default: platform data dir, or $DHUNN_DB
 dhunn analyze <dir> [--force] [-j N] [-q] [--added-by <user>]  # scan + analyze (✅ except --added-by)
 dhunn stats                            # library totals + recent failures (✅)
-dhunn import spotify|apple <path> --user <name>   # history export → history_plays
+dhunn import spotify|apple <path> --user <name>   # ✅ history export → history_plays + matching
+dhunn history --user <name>          # ✅ match rates, top artists/tracks
+dhunn dev sample-history --out <dir> [--days N --seed S --regions K]  # ✅ simulated listener
 dhunn index                           # build index, clusters, artist graph
 dhunn mb-sync                         # optional MusicBrainz/ListenBrainz matching (rate-limited)
 dhunn session --user <name>
@@ -229,7 +244,7 @@ symphonia, rubato, realfft, ndarray, rayon, ort (ONNX Runtime), rusqlite, lofty,
 
 1. ✅ `core`, `audio`, `dsp` + `inspect` command — validated against librosa (`ml/validate_dsp.py`).
 2. ✅ `store`, `meta` (tags), `analysis`, `analyze` + `stats` commands.
-3. `import` (Spotify first, then Apple) + track matching — gives real data before any algorithm work.
+3. ✅ `import` (Spotify extended + basic, Apple best-effort) + track matching + simulated-listener sample data.
 4. `index` (exact) + basic `session --seed` (similarity only).
 5. `eval` on imported history + simulated users — baseline numbers.
 6. `profile` (per user, adventurousness) + `steer` (drift, destination) + `explain`.
