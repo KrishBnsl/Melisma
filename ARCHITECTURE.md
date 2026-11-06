@@ -36,9 +36,9 @@ dhunn/
 │   ├── dhunn-store/           # SQLite (rusqlite) for metadata, features, events
 │   ├── dhunn-meta/            # tag reading + artist-credit parsing (lofty) ✅; later MusicBrainz matching + artist graph, ListenBrainz similar-artists / discovery items
 │   ├── dhunn-import/          # Spotify (extended + basic) / Apple parsers, history → library matching ✅
-│   ├── dhunn-index/           # vector index (exact for small, HNSW for large) + graph
+│   ├── dhunn-index/           # sound space: aspect-weighted vectors, exact kNN, aspect closeness ✅; later HNSW + graph
 │   ├── dhunn-profile/         # long-term taste + session state
-│   ├── dhunn-steer/           # exploration modes, trajectory planning
+│   ├── dhunn-steer/           # sessions: next pick + feedback (basic drift model ✅); later modes, trajectory planning
 │   ├── dhunn-score/           # candidate scoring + blending weights
 │   ├── dhunn-explain/         # human-readable reasons
 │   ├── dhunn-eval/            # simulated listeners ✅; offline metrics, A/B session export
@@ -107,6 +107,14 @@ history_plays(id, user_id, ts, source, raw_artist, raw_title, raw_album, ms_play
               UNIQUE (user_id, source, ts, raw_artist, raw_title)  -- re-import is a no-op
 ```
 
+**Implemented** (migration 3):
+
+```
+sessions(id, user_id, started_at, ended_at, mode, params JSON)
+events(id, session_id, user_id, ts_ms, track_id, kind, position_ms, payload JSON, schema_version)
+       -- kind: play | complete | skip | like | dislike | further | back | pause | resume | quit | error
+```
+
 **Planned** (later migrations, with the steps that need them):
 
 ```
@@ -114,8 +122,6 @@ tracks.added_by -> users
 artist_links(a, b, kind, weight, source)     -- collab, member_of, influence, same_label, lb_similar
 embeddings(track_id, model, version, vec BLOB)
 external_items(id, mb_recording_id, mb_artist_id, title, artist, source, link)  -- no audio
-events(id, ts, user_id, session_id, track_id, kind, payload JSON, schema_version)
-sessions(id, user_id, started_at, mode, vibe JSON, context JSON, private BOOL)
 ```
 
 ## 4b. Library scan (`dhunn-analysis`) — *implemented*
@@ -142,6 +148,11 @@ Decoding/analysis runs on a bounded worker pool (default: half the cores, max 6)
 
 ## 5. Index (`dhunn-index`)
 
+**Implemented (DSP only):** the 134 DSP dimensions are z-scored (clipped to ±4) and grouped into seven **aspects** — timbre (MFCC), brightness (centroid/rolloff/flatness/contrast/ZCR), harmony (key-relative chroma, mode, clarity), rhythm (tempo, pulse, onsets), punch (HPSS balance, thump), dynamics, pitch. Each aspect is scaled by `weight / √dims`, so it counts by its weight however many dimensions it has (timbre 80, rhythm 4); default weights: timbre, brightness, rhythm 1.0 · punch 0.8 · harmony 0.7 · dynamics, pitch 0.5. Rows are L2-normalized (dot = cosine). Search is exact and parallel; the space is rebuilt from the store at startup (milliseconds at FMP scale; persisting it is a later optimization).
+
+**Explanations** use per-aspect *closeness* `1 − d / typical d` (typical = mean distance between random pairs, sampled at build time), so an aspect is only cited when two tracks are unusually close on it — plain cosine on a 3-dim aspect looked "99% similar" for most pairs.
+
+**Planned:**
 - **Combined sound space:** per-track vector = concat of normalized blocks [dsp (z-scored, PCA→32), audio_emb (→64), clap (→64)] with per-block weights. Weights live in config so eval can tune them.
 - **Search:** `VectorIndex` trait with `Exact` (brute force, SIMD, parallel with rayon; the default — 500k × 160 f32 ≈ 320 MB, roughly 10–20 ms per query single-threaded and a few ms in parallel, inside the 50 ms budget) and `Hnsw` (e.g. `hnsw_rs` or `usearch`) as an optional impl for the top end or low-RAM devices.
 - **Artist graph:** petgraph from `artist_links` (MusicBrainz + ListenBrainz similar-artists) + derived "sounds-like" edges (artist centroid kNN). Used for stepping stones and explanations.
@@ -158,6 +169,16 @@ Decoding/analysis runs on a bounded worker pool (default: half the cores, max 6)
 - Updates are pure functions of `(state, event) → state` — easy to test and replay from the event log.
 
 ## 7. Steering (`dhunn-steer`)
+
+**Implemented — basic drift model** (step 4; the planner below extends it in step 6). A session keeps an **anchor** (starts at the seeds' centroid), an **exploration** level `e` (from adventurousness: `0.1 + 0.5·a`) and recent **avoid** points. Each pick scores the ~60–200 tracks nearest the anchor:
+
+```
+score = (1 − e)·sim(anchor) + 1.0·sim(previous track) − e·sim(recently heard centroid) − 0.5·Σ w·sim(avoid)
+```
+
+then samples among the best 3–8. Continuity with the previous track plus repulsion from what was heard makes sessions move *forward* along a path instead of circling or hopping across the anchor. Feedback: **finish** pulls the anchor 20% toward the track; **like** 40%; an **early skip** adds an avoid point (weight falls with how late the skip was) and eases exploration down; **dislike** bans the track and adds a strong avoid point; **further** raises `e` by 0.2 and extrapolates the anchor past the current track in the direction of travel; **back** lowers `e` and restores the previous anchor. Never in a session: seeds, a second version of the same song (same normalized artist + title — WAV/MP3 copies, remasters), more than 2 tracks in a row by one artist; across sessions, tracks played in the last 36 h are skipped while alternatives exist.
+
+**Planned (step 6):**
 
 Each mode produces a **target** and a **step budget**:
 
@@ -203,7 +224,9 @@ Each pick returns structured `Reason`s → rendered text:
 
 ## 10. Events & logging
 
-Every CLI action emits an `Event` (play, skip{at_ms}, complete, replay, like, dislike, never, more_like, further, back, too_far, vibe_set) to the store. Signals only a real player can produce (volume changes, seek) get event kinds reserved now and are emitted once the apps exist. Profile/session state can be rebuilt by replaying events. Versioned schema from day one.
+**Implemented:** `dhunn play` logs play, complete, skip (with position), like, dislike, further, back, pause/resume, quit and error to `events`, each written immediately. These are the real feedback for tuning; profile building (step 6) will read them alongside imported history.
+
+Originally planned: every CLI action emits an `Event` (play, skip{at_ms}, complete, replay, like, dislike, never, more_like, further, back, too_far, vibe_set) to the store. Signals only a real player can produce (volume changes, seek) get event kinds reserved now and are emitted once the apps exist. Profile/session state can be rebuilt by replaying events. Versioned schema from day one.
 
 ## 11. Evaluation (`dhunn-eval`)
 
@@ -223,7 +246,10 @@ dhunn stats                            # library totals + recent failures (✅)
 dhunn import spotify|apple <path> --user <name>   # ✅ history export → history_plays + matching
 dhunn history --user <name>          # ✅ match rates, top artists/tracks
 dhunn dev sample-history --out <dir> [--days N --seed S --regions K]  # ✅ simulated listener
-dhunn index                           # build index, clusters, artist graph
+dhunn similar <song words> [-n 10]    # ✅ nearest tracks + which aspects they share
+dhunn session [--seed <song words>]... [--user] [--len N] [--adventure A] [--rng S]  # ✅ print a planned session
+dhunn play [--seed <song words>]... [--user] [--adventure A]  # ✅ listen: space pause · n next · l like · d dislike · f further · b back · ± volume · q quit
+dhunn index                           # (not needed yet: the space is built at startup) clusters, artist graph
 dhunn mb-sync                         # optional MusicBrainz/ListenBrainz matching (rate-limited)
 dhunn session --user <name>
              --seed <track>... | --vibe "rainy night drive" | --mood e=0.3,v=-0.2
@@ -245,7 +271,7 @@ symphonia, rubato, realfft, ndarray, rayon, ort (ONNX Runtime), rusqlite, lofty,
 1. ✅ `core`, `audio`, `dsp` + `inspect` command — validated against librosa (`ml/validate_dsp.py`).
 2. ✅ `store`, `meta` (tags), `analysis`, `analyze` + `stats` commands.
 3. ✅ `import` (Spotify extended + basic, Apple best-effort) + track matching + simulated-listener sample data.
-4. `index` (exact) + basic `session --seed` (similarity only).
+4. ✅ `index` (exact, aspect-weighted) + basic steering session + **`dhunn play`** (rodio playback, keyboard controls, event logging) — pulled forward so the app can be used daily and real feedback accumulates.
 5. `eval` on imported history + simulated users — baseline numbers.
 6. `profile` (per user, adventurousness) + `steer` (drift, destination) + `explain`.
 7. `embed` (CLAP + audio model) → vibe text, surprise/new modes; re-run eval.

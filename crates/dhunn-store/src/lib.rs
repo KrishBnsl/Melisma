@@ -15,7 +15,9 @@ use dhunn_core::{FeatureVec, TrackId, TrackMeta, normalize_name};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 mod history;
+mod sessions;
 pub use history::*;
+pub use sessions::*;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -119,6 +121,29 @@ CREATE TABLE history_plays (
 CREATE INDEX history_by_user_ts ON history_plays(user_id, ts);
 CREATE INDEX history_by_track ON history_plays(track_id);
 CREATE INDEX history_by_key ON history_plays(raw_artist, raw_title);
+"#,
+    r#"
+CREATE TABLE sessions (
+    id         INTEGER PRIMARY KEY,
+    user_id    INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    started_at INTEGER NOT NULL,
+    ended_at   INTEGER,
+    mode       TEXT    NOT NULL,
+    params     TEXT
+);
+CREATE TABLE events (
+    id             INTEGER PRIMARY KEY,
+    session_id     INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    user_id        INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    ts_ms          INTEGER NOT NULL,
+    track_id       INTEGER REFERENCES tracks(id) ON DELETE SET NULL,
+    kind           TEXT    NOT NULL,
+    position_ms    INTEGER,
+    payload        TEXT,
+    schema_version INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX events_by_user_ts ON events(user_id, ts_ms);
+CREATE INDEX events_by_session ON events(session_id);
 "#,
 ];
 

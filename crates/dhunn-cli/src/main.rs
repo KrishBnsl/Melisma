@@ -2,6 +2,7 @@
 
 mod history;
 mod library;
+mod listen;
 
 use std::{
     path::{Path, PathBuf},
@@ -90,6 +91,42 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         top: usize,
     },
+    /// List the tracks that sound most like a song (search by title/artist words).
+    Similar {
+        query: String,
+        #[arg(short, default_value_t = 10)]
+        n: usize,
+    },
+    /// Print a planned session without playing it.
+    Session {
+        /// Start from these songs (search words; repeatable). Default: your most-played.
+        #[arg(long = "seed")]
+        seeds: Vec<String>,
+        #[arg(long, short)]
+        user: Option<String>,
+        #[arg(long, default_value_t = 15)]
+        len: usize,
+        /// Override the user's adventurousness (0..1) for this session.
+        #[arg(long)]
+        adventure: Option<f32>,
+        /// Random seed, for reproducible sessions.
+        #[arg(long, default_value_t = 1)]
+        rng: u64,
+    },
+    /// Listen: plays a steered session with keyboard controls; every action is logged.
+    Play {
+        /// Start from these songs (search words; repeatable). Default: your most-played.
+        #[arg(long = "seed")]
+        seeds: Vec<String>,
+        #[arg(long, short)]
+        user: Option<String>,
+        /// Override the user's adventurousness (0..1) for this session.
+        #[arg(long)]
+        adventure: Option<f32>,
+        /// Non-interactive audio check: play N seconds of 3 tracks.
+        #[arg(long, hide = true)]
+        smoke: Option<u64>,
+    },
     /// Developer tools.
     Dev {
         #[command(subcommand)]
@@ -128,6 +165,35 @@ fn main() -> Result<()> {
         } => history::import(&library::db_path(db)?, service, &path, &user),
         Command::History { user, top } => history::history(&library::db_path(db)?, &user, top),
         Command::Dev { action } => history::dev(&library::db_path(db)?, action),
+        Command::Similar { query, n } => listen::similar(&library::db_path(db)?, &query, n),
+        Command::Session {
+            seeds,
+            user,
+            len,
+            adventure,
+            rng,
+        } => listen::session(
+            &library::db_path(db)?,
+            &seeds,
+            user.as_deref(),
+            len,
+            adventure,
+            rng,
+        ),
+        Command::Play {
+            seeds,
+            user,
+            adventure,
+            smoke,
+        } => listen::play(
+            &library::db_path(db)?,
+            listen::PlayOptions {
+                seeds: &seeds,
+                user: user.as_deref(),
+                adventure,
+                smoke,
+            },
+        ),
         Command::Inspect {
             path,
             json,

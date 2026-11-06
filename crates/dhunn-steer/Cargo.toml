@@ -1,0 +1,10 @@
+[package]
+name = "dhunn-steer"
+description = "Listening sessions: picking the next track and reacting to feedback"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+dhunn-core.workspace = true
+dhunn-index.workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "dhunn-index"
+description = "The sound space: weighted, normalized track vectors and exact nearest-neighbour search"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+dhunn-core.workspace = true
+dhunn-dsp.workspace = true
+dhunn-store.workspace = true
+rayon.workspace = true

@@ -16,15 +16,19 @@ dhunn-meta = { path = "crates/dhunn-meta" }
 dhunn-analysis = { path = "crates/dhunn-analysis" }
 dhunn-import = { path = "crates/dhunn-import" }
 dhunn-eval = { path = "crates/dhunn-eval" }
+dhunn-index = { path = "crates/dhunn-index" }
+dhunn-steer = { path = "crates/dhunn-steer" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
+crossterm = "0.29"
 csv = "1.4"
 dirs = "7"
 hound = "3.5"
 lofty = "0.25"
 rayon = "1"
 realfft = "3"
+rodio = { version = "0.23", default-features = false, features = ["playback", "symphonia-all"] }
 rubato = "0.16"
 rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
