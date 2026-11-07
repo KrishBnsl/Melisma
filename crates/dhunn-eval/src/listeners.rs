@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::rng::Rng;
 use crate::simulate::{SimConfig, SimError, simulate_spotify_history};
-use crate::taste::{Taste, skip_probability};
+use crate::taste::{Taste, TasteSpace, skip_probability};
 
 #[derive(Debug, Clone)]
 pub struct ListenerConfig {
@@ -35,6 +35,8 @@ pub struct ListenerConfig {
     pub adventure_levels: Vec<f32>,
     /// Base steering configuration (artist/song keys, parameters).
     pub steer: SessionConfig,
+    /// Which features the listeners' hidden tastes are defined in.
+    pub judge: TasteSpace,
 }
 
 impl Default for ListenerConfig {
@@ -46,6 +48,7 @@ impl Default for ListenerConfig {
             seed: 7,
             adventure_levels: vec![0.2, 0.5, 0.8],
             steer: SessionConfig::default(),
+            judge: TasteSpace::Dsp,
         }
     }
 }
@@ -89,6 +92,9 @@ pub struct ModeRow {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ListenerReport {
+    /// Which features the listeners' tastes were defined in.
+    #[serde(default)]
+    pub judge: TasteSpace,
     pub listeners: usize,
     pub sessions: usize,
     pub length: usize,
@@ -373,7 +379,7 @@ pub fn simulated_listeners(
     for l in 0..cfg.listeners {
         let lseed = cfg.seed.wrapping_mul(1_000_003).wrapping_add(l as u64);
         let mut rng = Rng::new(lseed);
-        let taste = Taste::hidden(store, &mut rng, 2)?;
+        let taste = Taste::hidden_in(store, cfg.judge, &mut rng, 2)?;
         // The listener's past: the same hidden taste, simulated as 60 days of history.
         let (rows, _, _) = simulate_spotify_history(
             store,
@@ -383,6 +389,7 @@ pub fn simulated_listeners(
                 taste_regions: 2,
                 unowned_share: 0.0,
                 respell_share: 0.0,
+                taste_space: cfg.judge,
                 ..Default::default()
             },
         )?;
@@ -496,6 +503,7 @@ pub fn simulated_listeners(
         })
         .collect();
     Ok(ListenerReport {
+        judge: cfg.judge,
         listeners: cfg.listeners,
         sessions: cfg.sessions,
         length: cfg.length,

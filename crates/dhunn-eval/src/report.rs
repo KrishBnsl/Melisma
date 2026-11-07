@@ -13,6 +13,9 @@ pub struct Report {
     pub created_at: i64,
     pub label: Option<String>,
     pub library_tracks: usize,
+    /// Share of "sounds like" from learned embeddings (0 = DSP only).
+    #[serde(default)]
+    pub clap_share: f32,
     pub user: Option<String>,
     pub params: Vec<(String, f32)>,
     pub replay: Option<ReplayReport>,
@@ -118,8 +121,13 @@ pub fn render(r: &Report, prev: Option<&Report>) -> String {
         })
         .collect();
     out.push_str(&format!(
-        "Library: {} tracks · steering: {}\n",
+        "Library: {} tracks · sound space: {} · steering: {}\n",
         r.library_tracks,
+        if r.clap_share > 0.0 {
+            format!("{:.0}% CLAP", r.clap_share * 100.0)
+        } else {
+            "DSP only".to_owned()
+        },
         params.join(", ")
     ));
 
@@ -191,8 +199,8 @@ pub fn render(r: &Report, prev: Option<&Report>) -> String {
     if let Some(l) = &r.listeners {
         let pl = prev.and_then(|p| p.listeners.as_ref());
         out.push_str(&format!(
-            "\nSimulated listeners: {} listeners × {} sessions × {} tracks, each starting from one of their favourites\n\n",
-            l.listeners, l.sessions, l.length
+            "\nSimulated listeners (taste defined in {} features): {} listeners × {} sessions × {} tracks, each starting from one of their favourites\n\n",
+            l.judge.name().to_uppercase(), l.listeners, l.sessions, l.length
         ));
         let rows: Vec<Vec<String>> = l
             .rows
@@ -290,6 +298,7 @@ mod tests {
             created_at: 0,
             label: None,
             library_tracks: 10,
+            clap_share: 0.0,
             user: Some("krish".into()),
             params: params_list(&SteerParams::default()),
             replay: Some(ReplayReport {

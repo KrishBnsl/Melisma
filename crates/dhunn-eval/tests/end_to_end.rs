@@ -163,6 +163,7 @@ fn eval_runs_on_simulated_history() {
         created_at: 0,
         label: None,
         library_tracks: space.len(),
+        clap_share: 0.0,
         user: Some("sim".into()),
         params: params_list(&SteerParams::default()),
         replay: Some(rep),
@@ -176,4 +177,35 @@ fn eval_runs_on_simulated_history() {
     );
     assert!(text.contains("steer a=0.8"), "{text}");
     assert!(text.contains("none yet"), "{text}");
+}
+
+#[test]
+fn listeners_can_be_judged_in_clap_space() {
+    let mut store = library();
+    // Synthetic "CLAP" embeddings: a different view of the same ring (doubled angle), so
+    // DSP and CLAP neighbours disagree in places.
+    for i in 0..120u64 {
+        let a = (i as f32 / 120.0 * std::f32::consts::TAU) * 2.0;
+        let t = dhunn_core::TrackId(i + 1);
+        store
+            .save_embedding(t, dhunn_index::CLAP_MODEL, 1, &[a.cos(), a.sin(), 0.2, 0.1])
+            .unwrap();
+    }
+    let space = SoundSpace::from_store_blended(&store, &AspectWeights::default(), 0.25).unwrap();
+    assert!(space.has_clap());
+    let lis = simulated_listeners(
+        &store,
+        &space,
+        &ListenerConfig {
+            listeners: 3,
+            sessions: 2,
+            length: 12,
+            judge: dhunn_eval::TasteSpace::Clap,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(lis.judge, dhunn_eval::TasteSpace::Clap);
+    let r = |n: &str| lis.rows.iter().find(|r| r.name == n).unwrap();
+    assert!(r("steer a=0.5").taste > r("random").taste + 10.0, "{lis:?}");
 }

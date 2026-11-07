@@ -19,6 +19,7 @@ dhunn-eval = { path = "crates/dhunn-eval" }
 dhunn-index = { path = "crates/dhunn-index" }
 dhunn-steer = { path = "crates/dhunn-steer" }
 dhunn-profile = { path = "crates/dhunn-profile" }
+dhunn-embed = { path = "crates/dhunn-embed" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
@@ -27,6 +28,7 @@ csv = "1.4"
 dirs = "7"
 hound = "3.5"
 lofty = "0.25"
+ort = "=2.0.0-rc.15"
 rayon = "1"
 realfft = "3"
 rodio = { version = "0.23", default-features = false, features = ["playback", "symphonia-all"] }
@@ -38,6 +40,7 @@ strsim = "0.11"
 symphonia = { version = "0.5.5", features = ["all"] }
 tempfile = "3"
 thiserror = "2"
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
 walkdir = "2.5"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 

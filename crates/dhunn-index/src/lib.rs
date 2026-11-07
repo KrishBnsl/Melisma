@@ -101,6 +101,12 @@ impl AspectWeights {
 }
 
 const Z_CLIP: f32 = 4.0;
+/// The name CLAP embeddings are stored under (see `dhunn-embed`).
+pub const CLAP_MODEL: &str = "clap";
+/// Default share of "sounds like" that comes from CLAP when embeddings exist. Chosen with
+/// `dhunn eval --clap-share` under listeners whose taste is defined in DSP features and in
+/// CLAP embeddings: 0.25 has the best worst case of the two (see ARCHITECTURE.md §11).
+pub const DEFAULT_CLAP_SHARE: f32 = 0.25;
 
 pub struct SoundSpace {
     ids: Vec<TrackId>,
@@ -108,8 +114,13 @@ pub struct SoundSpace {
     dims: usize,
     /// Weighted, L2-normalized rows (`ids.len() × dims`).
     unit: Vec<f32>,
-    /// Z-scored rows before weighting, for per-aspect comparisons.
+    /// Z-scored DSP rows before weighting, for per-aspect comparisons (`zdims` wide).
     z: Vec<f32>,
+    zdims: usize,
+    /// Raw (unit) CLAP embeddings, for matching text — they share CLAP's text space.
+    clap: HashMap<TrackId, Vec<f32>>,
+    /// Share of similarity that comes from CLAP (0 = DSP only).
+    clap_share: f32,
     /// Dimension indices of each aspect present.
     aspects: Vec<(Aspect, Vec<usize>)>,
     /// Typical (mean) z-space distance between two tracks on each aspect, for judging
@@ -230,15 +241,109 @@ impl SoundSpace {
             dims,
             unit,
             z,
+            zdims: dims,
+            clap: HashMap::new(),
+            clap_share: 0.0,
             aspects,
             typical,
         }
     }
 
-    /// Builds the space from the store's current DSP features.
+    /// Mixes learned embeddings (CLAP) into the space: each track's vector becomes
+    /// `[√(1−share)·dsp, √share·clap]`, so similarity = (1−share)·DSP + share·CLAP. The
+    /// embeddings are centred on the library mean first (CLAP vectors share a large common
+    /// component, which would make every pair look alike). Tracks without an embedding keep
+    /// only their DSP part. Skipped (DSP only) if fewer than half the tracks have one.
+    pub fn with_embeddings(mut self, emb: HashMap<TrackId, Vec<f32>>, share: f32) -> Self {
+        let share = share.clamp(0.0, 1.0);
+        let covered = self.ids.iter().filter(|t| emb.contains_key(t)).count();
+        let Some(edims) = emb.values().next().map(Vec::len) else {
+            return self;
+        };
+        if covered * 2 < self.ids.len() || edims == 0 {
+            return self;
+        }
+        let mut mean = vec![0f64; edims];
+        for t in &self.ids {
+            if let Some(e) = emb.get(t) {
+                mean.iter_mut().zip(e).for_each(|(m, x)| *m += *x as f64);
+            }
+        }
+        mean.iter_mut().for_each(|m| *m /= covered as f64);
+        let (a, b) = ((1.0 - share).sqrt(), share.sqrt());
+        let old = self.dims;
+        let dims = old + edims;
+        let mut unit = vec![0f32; self.ids.len() * dims];
+        for (i, t) in self.ids.iter().enumerate() {
+            let row = &mut unit[i * dims..(i + 1) * dims];
+            row[..old]
+                .iter_mut()
+                .zip(&self.unit[i * old..(i + 1) * old])
+                .for_each(|(r, x)| *r = a * x);
+            if let Some(e) = emb.get(t) {
+                let mut c: Vec<f32> = e.iter().zip(&mean).map(|(x, m)| x - *m as f32).collect();
+                normalize(&mut c);
+                row[old..].iter_mut().zip(&c).for_each(|(r, x)| *r = b * x);
+            }
+            normalize(row);
+        }
+        self.unit = unit;
+        self.dims = dims;
+        self.clap_share = share;
+        self.clap = emb
+            .into_iter()
+            .filter(|(t, _)| self.pos.contains_key(t))
+            .map(|(t, mut e)| {
+                normalize(&mut e);
+                (t, e)
+            })
+            .collect();
+        self
+    }
+
+    /// Share of similarity that comes from learned embeddings (0 = DSP only).
+    pub fn clap_share(&self) -> f32 {
+        self.clap_share
+    }
+
+    pub fn has_clap(&self) -> bool {
+        !self.clap.is_empty()
+    }
+
+    /// The tracks that best match a CLAP text (or audio) embedding, best first, by raw
+    /// CLAP similarity — independent of how much CLAP counts in "sounds like".
+    pub fn clap_matches(
+        &self,
+        query: &[f32],
+        k: usize,
+        keep: impl Fn(TrackId) -> bool,
+    ) -> Vec<(TrackId, f32)> {
+        let mut v: Vec<(TrackId, f32)> = self
+            .clap
+            .iter()
+            .filter(|(t, _)| keep(**t))
+            .map(|(&t, e)| (t, dot(e, query)))
+            .collect();
+        v.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        v.truncate(k);
+        v
+    }
+
+    /// Builds the space from the store's current DSP features, without learned embeddings.
     pub fn from_store(store: &Store, weights: &AspectWeights) -> Result<Self, StoreError> {
         let (names, rows) = store.feature_matrix("dsp", dhunn_dsp::DSP_VERSION)?;
         Ok(Self::build(&names, rows, weights))
+    }
+
+    /// DSP features plus the store's CLAP embeddings (if any) at `clap_share`.
+    pub fn from_store_blended(
+        store: &Store,
+        weights: &AspectWeights,
+        clap_share: f32,
+    ) -> Result<Self, StoreError> {
+        let space = Self::from_store(store, weights)?;
+        let emb = store.latest_embeddings(CLAP_MODEL)?;
+        Ok(space.with_embeddings(emb, clap_share))
     }
 
     pub fn len(&self) -> usize {
@@ -326,8 +431,8 @@ impl SoundSpace {
             return Vec::new();
         };
         let (ra, rb) = (
-            &self.z[i * self.dims..(i + 1) * self.dims],
-            &self.z[j * self.dims..(j + 1) * self.dims],
+            &self.z[i * self.zdims..(i + 1) * self.zdims],
+            &self.z[j * self.zdims..(j + 1) * self.zdims],
         );
         let mut out: Vec<(Aspect, f32)> = self
             .aspects
@@ -432,5 +537,70 @@ mod tests {
         assert!((dot(&c, &c) - 1.0).abs() < 1e-5);
         assert!(s.centroid(&[(TrackId(99), 1.0)]).is_none());
         assert!(s.nearest(&c, 0, |_| true).is_empty());
+    }
+
+    /// 40 tracks on a circle in a 2-D DSP space.
+    fn circle() -> SoundSpace {
+        let names: Vec<String> = ["mfcc00_mean", "log2_tempo"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let rows = (0..40)
+            .map(|i| {
+                let a = i as f32 / 40.0 * std::f32::consts::TAU;
+                (TrackId(i + 1), vec![a.cos(), a.sin()])
+            })
+            .collect();
+        SoundSpace::build(&names, rows, &AspectWeights::default())
+    }
+
+    #[test]
+    fn embeddings_blend_into_similarity() {
+        // CLAP says tracks 1 and 21 (opposite on the DSP circle) sound alike; others differ.
+        let emb = |t: u64| -> Vec<f32> {
+            let mut v = vec![0.1f32; 8];
+            let slot = if t == 1 || t == 21 {
+                0
+            } else {
+                (t % 7 + 1) as usize
+            };
+            v[slot] = 1.0;
+            v
+        };
+        let all: HashMap<TrackId, Vec<f32>> = (1..=40).map(|t| (TrackId(t), emb(t))).collect();
+        let dsp = circle();
+        let before = dsp.similarity(TrackId(1), TrackId(21));
+        assert!(before < -0.9);
+
+        let half = circle().with_embeddings(all.clone(), 0.5);
+        let mid = half.similarity(TrackId(1), TrackId(21));
+        assert!(mid > before + 0.5, "{before} → {mid}");
+        assert!((half.clap_share() - 0.5).abs() < 1e-6);
+        // Every vector is still a unit vector.
+        let v = half.vector(TrackId(5)).unwrap();
+        assert!((dot(v, v) - 1.0).abs() < 1e-5);
+
+        let only = circle().with_embeddings(all.clone(), 1.0);
+        assert!(only.similarity(TrackId(1), TrackId(21)) > 0.99);
+        assert!(
+            circle()
+                .with_embeddings(all.clone(), 0.0)
+                .similarity(TrackId(1), TrackId(21))
+                < -0.9
+        );
+
+        // Text matching uses the raw embeddings.
+        let q = emb(1);
+        let m = half.clap_matches(&q, 2, |_| true);
+        let ids: Vec<u64> = m.iter().map(|x| x.0.0).collect();
+        assert!(ids.contains(&1) && ids.contains(&21), "{ids:?}");
+
+        // Too few tracks with embeddings: DSP only.
+        let few: HashMap<TrackId, Vec<f32>> = (1..=10).map(|t| (TrackId(t), emb(t))).collect();
+        let s = circle().with_embeddings(few, 0.5);
+        assert!(!s.has_clap());
+        assert_eq!(s.similarity(TrackId(1), TrackId(21)), before);
+        // Aspect explanations still work on the blended space.
+        assert!(!half.aspect_similarities(TrackId(1), TrackId(2)).is_empty());
     }
 }

@@ -31,7 +31,7 @@ dhunn/
 │   ├── dhunn-core/            # shared types: TrackId, FeatureVec, Event, errors, config
 │   ├── dhunn-audio/           # decode + resample + framing (symphonia, rubato)
 │   ├── dhunn-dsp/             # spectral, MFCC, chroma, HPSS, onset, tempo, loudness
-│   ├── dhunn-embed/           # ONNX inference (ort): audio embedding, CLAP text/audio
+│   ├── dhunn-embed/           # ONNX inference (ort): CLAP audio + text embeddings ✅
 │   ├── dhunn-analysis/        # library scan: change detection, dedupe by audio hash, parallel audio→dsp(→embed)
 │   ├── dhunn-store/           # SQLite (rusqlite) for metadata, features, events
 │   ├── dhunn-meta/            # tag reading + artist-credit parsing (lofty) ✅; later MusicBrainz matching + artist graph, ListenBrainz similar-artists / discovery items
@@ -73,10 +73,13 @@ Output: `DspSummary` (named, human-readable — used for explanations) and its f
 
 Not yet: tuning estimation for chroma, true LUFS (K-weighted) loudness, beat tracking / regularity.
 
-**Embeddings** (`dhunn-embed`, `ort`):
-- `audio_emb`: general-purpose music embedding (MERT-class or similar, chosen in `ml/` for license + size).
-- `clap_audio`: CLAP audio embedding (shares space with CLAP text → enables vibe text search).
-- Derived heads (small linear/MLP, trained later): valence, arousal, danceability. M1 can use CLAP zero-shot prompts ("happy", "sad", "energetic"…) as a placeholder.
+**Embeddings** (`dhunn-embed`, `ort`) — **implemented (step 7): CLAP.**
+- **Model:** LAION CLAP trained on music (HTSAT-base audio encoder + RoBERTa text encoder, 512-d shared space), from LAION's original checkpoint `music_audioset_epoch_15_esc_90.14.pt` (CC0), converted in `ml/export_clap.py`. The Hugging Face conversion `laion/larger_clap_music` is unusable: its projection layers are untrained (zero biases, init-scale weights, logit scales ≈ 1) and its encoders don't match the original, so every text scored ≈ 0.01 against every track. The export loads the original strictly (only HTSAT's classification heads and rebuilt buffers may be left over), checks that the original model's own mel filters equal the front end baked into the graph (|Δ| 4e-9), and that ONNX equals transformers (cosine 1.000000, audio and text).
+- **Front end inside the graph:** `audio.onnx` takes raw mono 48 kHz audio; reflect padding, a windowed DFT as one strided convolution, the Slaney mel filters and the dB conversion are constants in the graph. Rust only decodes, resamples (rubato) and cuts clips.
+- **Per track:** three 10 s clips at 15/45/75 % of the track (shorter tracks repeat-padded, as in training), embedded in one batch and averaged. ~2.3 tracks/s on an M-series CPU (479 tracks in 205 s), so ~70 min per 10k tracks, once. `dhunn embed` is separate from `analyze` (models stay optional; e.g. DSP-only on Android) and resumable.
+- **Text:** RoBERTa BPE via the pure-Rust `tokenizers` crate (the tokenizer's own padding/truncation switched off — it padded batches with an all-ones mask and changed embeddings by up to 13%); ≤ 77 tokens.
+- **Runtime:** ONNX Runtime CPU. `ort`'s default "most efficient device" policy picks CoreML on macOS, which can't run HTSAT, so sessions prefer CPU explicitly. One ORT environment per process.
+- Later: a general audio embedding (MERT-class, licence permitting) if CLAP proves too coarse; mood heads (valence/arousal) trained on CLAP.
 
 **Parallelism:** rayon over tracks; embedding batched. Resumable — each track keyed by content hash (xxhash of decoded PCM sample) + analysis version, so re-runs skip done work.
 
@@ -123,6 +126,12 @@ events(id, session_id, user_id, ts_ms, track_id, kind, position_ms, payload JSON
 eval_runs(id, created_at, label, report JSON)   -- every `dhunn eval` run, so the next one shows changes
 ```
 
+**Implemented** (migration 5):
+
+```
+embeddings(track_id, model, version, vec BLOB, PRIMARY KEY (track_id, model))   -- CLAP vectors (512 × f32)
+```
+
 **Planned** (later migrations, with the steps that need them):
 
 ```
@@ -161,7 +170,7 @@ Decoding/analysis runs on a bounded worker pool (default: half the cores, max 6)
 **Explanations** use per-aspect *closeness* `1 − d / typical d` (typical = mean distance between random pairs, sampled at build time), so an aspect is only cited when two tracks are unusually close on it — plain cosine on a 3-dim aspect looked "99% similar" for most pairs.
 
 **Planned:**
-- **Combined sound space:** per-track vector = concat of normalized blocks [dsp (z-scored, PCA→32), audio_emb (→64), clap (→64)] with per-block weights. Weights live in config so eval can tune them.
+- **Combined sound space — implemented (step 7):** per-track vector = [√(1−s)·DSP unit vector, √s·CLAP], CLAP centred on the library mean first (raw CLAP vectors share a large common direction). Similarity = (1−s)·DSP cosine + s·CLAP cosine. `s` = 0.25 by default (`DEFAULT_CLAP_SHARE`, chosen in eval, §11); DSP only when fewer than half the tracks have embeddings. Aspect explanations still use the DSP part. Text queries match the raw CLAP vectors (`clap_matches`).
 - **Search:** `VectorIndex` trait with `Exact` (brute force, SIMD, parallel with rayon; the default — 500k × 160 f32 ≈ 320 MB, roughly 10–20 ms per query single-threaded and a few ms in parallel, inside the 50 ms budget) and `Hnsw` (e.g. `hnsw_rs` or `usearch`) as an optional impl for the top end or low-RAM devices.
 - **Artist graph:** petgraph from `artist_links` (MusicBrainz + ListenBrainz similar-artists) + derived "sounds-like" edges (artist centroid kNN). Used for stepping stones and explanations.
 - **External items:** no audio → not in the sound space. Placed via the artist graph: an item's position is approximated by the centroid of its nearest owned artists, and it is only ever surfaced in the separate "Discover" list, never mixed into a playable session.
@@ -215,7 +224,9 @@ with `taste_weight` 0.5 and `retention_weight` 1.0. The profile's pull fades fas
 
 **Routes:** Dijkstra over the place graph with hop cost (1 − similarity)², so many small steps beat one big jump. A journey leaves its starting place on the first pick and spends at most 2 picks per stop (paced to arrive within ~12). **Adaptation:** a skip on the way means "not this part of the way" — move on sooner (lingering at stops the listener skipped stalled journeys in eval: 79% arrived vs 89% after the change); "further" jumps to the next stop; "back" returns to the previous one. Explanations name the journey: "on the way to AC/DC · stop 3 of 5", "arrived near …", "surprise: a jump to a part of your library you haven't explored".
 
-**Still planned:** vibe (text → CLAP, step 7), toward a friend and bridge (step 8), artist-graph edges in routes (step 9).
+**Vibe — implemented (step 7):** `--vibe "rainy night drive"` embeds the text with CLAP, takes the 10 tracks whose CLAP vectors match it best, and travels to their (match-weighted) centre like any destination — a route of small steps from where you are, not a jump. `dhunn vibe "<text>"` lists the matches. On FMP: "heavy distorted rock guitars" → Nirvana, AC/DC, Apocalyptica, Metallica; "solo piano, calm" → Chopin Op. 28/4, Schumann Träumerei; "a crowd clapping" → the applause recordings; "drums only" fails (FMP has hardly any).
+
+**Still planned:** toward a friend and bridge (step 8), artist-graph edges in routes (step 9).
 
 ## 8. Scoring (`dhunn-score`)
 
@@ -318,6 +329,18 @@ Skip AUC: skip model 0.81, taste regions 0.76, previous track 0.74 (the single c
 
 The planned route gets there in ~8 tracks without a jarring jump, at the same skip rate. Surprise first aimed *away* from the listener's taste (42% skipped); aiming for unexplored places their taste still reaches brought that to 30%.
 
+**Step 7 — how much CLAP.** Simulated listeners' tastes are defined in DSP features by default, which would grade a DSP-only recommender by its own yardstick. `--judge clap` defines them in CLAP space instead; a blend that holds up under both is the robust choice. Steering, a=0.5, with profile:
+
+| CLAP share | taste (DSP judge) | taste (CLAP judge) | skipped (DSP / CLAP judge) | history replay hit@10 / MRR |
+|---|---|---|---|---|
+| 0 | 84.2 | 82.9 | 13.0% / 17.6% | 43.4% / 0.193 |
+| **0.25** | 83.8 | 85.9 | 13.6% / 13.0% | 43.4% / 0.194 |
+| 0.5 | 82.7 | 86.7 | 14.3% / 13.1% | 42.5% / 0.207 |
+| 0.75 | 81.3 | 88.0 | 16.1% / 11.7% | 39.8% / 0.204 |
+| 1 | 79.3 | 88.2 | 16.5% / 11.1% | 32.7% / 0.177 |
+
+0.25 has the best worst case (taste 83.8, skips 13.6%): DSP-like listeners lose almost nothing, CLAP-like listeners skip a quarter less. The history replay is simulated from DSP features too, so it leans the same way. Real listening (logged sessions) should settle it; `--clap-share` makes that a one-flag comparison.
+
 Planned: listening tests (export pairs of sessions from variants A and B as blind playlists; record preferences); steering-reach metrics once destinations exist.
 
 ## 12. CLI (`dhunn-cli`, clap)
@@ -331,10 +354,12 @@ dhunn import spotify|apple <path> --user <name>   # ✅ history export → histo
 dhunn history --user <name>          # ✅ match rates, top artists/tracks
 dhunn dev sample-history --out <dir> [--days N --seed S --regions K]  # ✅ simulated listener
 dhunn similar <song words> [-n 10]    # ✅ nearest tracks + which aspects they share
-dhunn session [--seed <song words>]... [--user] [--adventure A] [--mode drift|usual|surprise|new] [--to <song or artist>] [--len N] [--rng S]  # ✅ print a planned session
+dhunn session [--seed <song words>]... [--user] [--adventure A] [--mode drift|usual|surprise|new] [--to <song or artist> | --vibe "<description>"] [--len N] [--rng S]  # ✅ print a planned session
 dhunn play    (same steering options)  # ✅ listen: space pause · n next · l like · d dislike · f further · b back · s surprise me · ± volume · q quit
+dhunn embed [--models DIR] [--force] [-q]   # ✅ CLAP embeddings for analyzed tracks (resumable)
+dhunn vibe "<description>" [-n 10]          # ✅ tracks that best match a description
 dhunn profile [--user]               # ✅ taste regions, dislikes, skip-model weights
-dhunn eval [--user] [--holdout-days 14] [--listeners 16 --sessions 6 --len 25] [--param name=value]... [--label L] [--no-save] [--json]  # ✅ compared with the last run
+dhunn eval [--clap-share S] [--judge dsp|clap] [--user] [--holdout-days 14] [--listeners 16 --sessions 6 --len 25] [--param name=value]... [--label L] [--no-save] [--json]  # ✅ compared with the last run
 dhunn index                           # (not needed yet: the space is built at startup) clusters, artist graph
 dhunn mb-sync                         # optional MusicBrainz/ListenBrainz matching (rate-limited)
 dhunn session --user <name>
@@ -359,7 +384,7 @@ symphonia, rubato, realfft, ndarray, rayon, ort (ONNX Runtime), rusqlite, lofty,
 4. ✅ `index` (exact, aspect-weighted) + basic steering session + **`dhunn play`** (rodio playback, keyboard controls, event logging) — pulled forward so the app can be used daily and real feedback accumulates.
 5. ✅ `eval`: next-track replay on history, simulated listeners with feedback, logged-session summary; runs saved and compared — baseline numbers in §11.
 6. ✅ (6a) `profile`: taste regions, dislikes, learned skip model, both mixed into steering; `dhunn profile`. ✅ (6b) modes: usual, surprise me, something new, toward a song/artist along a planned route; journey explanations; mode metrics in eval.
-7. `embed` (CLAP + audio model) → vibe text, surprise/new modes; re-run eval.
+7. ✅ `embed`: CLAP (music) exported to ONNX, `dhunn embed`, blended into the sound space at 25%, `--vibe` and `dhunn vibe`; eval under DSP- and CLAP-defined listeners.
 8. Friend modes (`friend`, `bridge`, `friend_signal`) once two or more users have imported history.
 9. `meta` (MusicBrainz + ListenBrainz graph), `discover`, interactive mode + event logging. HNSW only if exact search gets slow.
 

@@ -18,7 +18,7 @@ use dhunn_store::{Store, StoreError};
 use serde::{Deserialize, Serialize};
 
 use crate::rng::Rng;
-use crate::taste::{Taste, skip_probability};
+use crate::taste::{Taste, TasteSpace, skip_probability};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SimError {
@@ -46,6 +46,9 @@ pub struct SimConfig {
     pub temperature: f64,
     /// Share of library picks that ignore taste (shuffle, radio, a friend's playlist).
     pub random_share: f64,
+    /// Which features the listener's taste is defined in.
+    #[serde(default)]
+    pub taste_space: TasteSpace,
 }
 
 impl Default for SimConfig {
@@ -59,6 +62,7 @@ impl Default for SimConfig {
             respell_share: 0.3,
             temperature: 0.12,
             random_share: 0.12,
+            taste_space: TasteSpace::Dsp,
         }
     }
 }
@@ -145,7 +149,7 @@ pub fn simulate_spotify_history(
     cfg: &SimConfig,
 ) -> Result<(Vec<ExtendedRow>, GroundTruth, SimStats), SimError> {
     let mut rng = Rng::new(cfg.seed);
-    let taste = Taste::hidden(store, &mut rng, cfg.taste_regions)?;
+    let taste = Taste::hidden_in(store, cfg.taste_space, &mut rng, cfg.taste_regions)?;
     let ids = taste.ids.clone();
 
     // Names and durations for every track.

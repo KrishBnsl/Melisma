@@ -42,6 +42,9 @@ pub struct SteerArgs {
     /// Travel toward this song or artist in small steps (search words).
     #[arg(long)]
     pub to: Option<String>,
+    /// Travel toward a described sound, e.g. "rainy night drive" (needs `dhunn embed`).
+    #[arg(long, conflicts_with = "to")]
+    pub vibe: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -66,7 +69,11 @@ fn now_ms() -> i64 {
 /// borrow the space while the player writes events to the store.
 pub(crate) fn load(db: &Path) -> Result<(Store, SoundSpace)> {
     let store = open(db)?;
-    let space = SoundSpace::from_store(&store, &AspectWeights::default())?;
+    let space = SoundSpace::from_store_blended(
+        &store,
+        &AspectWeights::default(),
+        dhunn_index::DEFAULT_CLAP_SHARE,
+    )?;
     if space.len() < 2 {
         bail!(
             "the library has {} analyzed tracks; run `dhunn analyze <folder>` first",
@@ -226,6 +233,47 @@ fn destination(store: &Store, space: &SoundSpace, words: &str) -> Result<Mode> {
     })
 }
 
+/// How many best-matching tracks define a vibe's destination.
+const VIBE_TRACKS: usize = 10;
+
+/// A described sound as a destination: the centre of the tracks CLAP thinks match it best,
+/// with those matches (best first).
+fn vibe_target(space: &SoundSpace, text: &str) -> Result<(Mode, Vec<(TrackId, f32)>)> {
+    if !space.has_clap() {
+        bail!("vibe search needs learned embeddings: run `dhunn embed` first");
+    }
+    let clap = crate::embed::text_clap()?;
+    let q = clap.embed_text(text)?;
+    let top = space.clap_matches(&q, VIBE_TRACKS, |_| true);
+    // Weight by how much better than the 10th match each one is, so the best count most.
+    let floor = top.last().map_or(0.0, |x| x.1);
+    let weighted: Vec<(TrackId, f32)> = top.iter().map(|&(t, s)| (t, s - floor + 0.01)).collect();
+    let target = space
+        .centroid(&weighted)
+        .context("no tracks match that description")?;
+    Ok((
+        Mode::Toward {
+            target,
+            label: format!("\"{text}\""),
+        },
+        top,
+    ))
+}
+
+/// `dhunn vibe "<text>"`: the tracks that best match a description.
+pub fn vibe(db: &Path, text: &str, n: usize) -> Result<()> {
+    let (store, space) = load(db)?;
+    if !space.has_clap() {
+        bail!("vibe search needs learned embeddings: run `dhunn embed` first");
+    }
+    let clap = crate::embed::text_clap()?;
+    let q = clap.embed_text(text)?;
+    for (t, s) in space.clap_matches(&q, n, |_| true) {
+        println!("{s:>6.3}  {}  [{}]", name(&store, t), facts(&store, t));
+    }
+    Ok(())
+}
+
 fn session_config(
     store: &Store,
     space: &SoundSpace,
@@ -236,6 +284,7 @@ fn session_config(
 ) -> Result<SessionConfig> {
     let adventure = args.adventure;
     let mode = match (&args.to, args.mode) {
+        _ if args.vibe.is_some() => vibe_target(space, args.vibe.as_deref().unwrap_or(""))?.0,
         (Some(words), _) => destination(store, space, words)?,
         (None, ModeArg::Drift) => Mode::Drift,
         (None, ModeArg::Usual) => Mode::Usual,
@@ -393,6 +442,11 @@ pub fn session(db: &Path, args: &SteerArgs, len: usize, rng_seed: u64) -> Result
         mode_line(&sess),
         sess.exploration()
     );
+    if let Some(v) = &args.vibe {
+        let (_, top) = vibe_target(&space, v)?;
+        let names: Vec<String> = top.iter().take(3).map(|&(t, _)| name(&store, t)).collect();
+        println!("\"{v}\" sounds most like: {}\n", names.join(" · "));
+    }
     for i in 1..=len {
         let Some(p) = sess.next_pick() else {
             println!("(library exhausted)");
@@ -502,6 +556,7 @@ pub fn play(db: &Path, args: &SteerArgs, smoke: Option<u64>) -> Result<()> {
         "seeds": seed_ids.iter().map(|t| t.0).collect::<Vec<_>>(),
         "exploration": sess.exploration(),
         "to": args.to,
+        "vibe": args.vibe,
     });
     // Automated audio checks are logged under their own mode so eval can ignore them.
     let mode = if smoke.is_some() {

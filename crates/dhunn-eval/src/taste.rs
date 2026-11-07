@@ -1,9 +1,10 @@
 //! A simulated listener's hidden taste: a few "home" tracks in z-scored DSP space, and each
 //! library track's affinity = cosine similarity to the nearest home.
 //!
-//! The taste lives in plain z-scored DSP features, *not* in the recommender's weighted sound
-//! space, so a recommender is not graded by its own yardstick (the two are still related:
-//! both come from the same features).
+//! The taste lives in plain z-scored features of one kind — DSP features, or CLAP
+//! embeddings — *not* in the recommender's weighted, blended sound space, so a recommender is
+//! not graded by its own yardstick. Evaluating under both kinds of listener shows whether a
+//! blend works for listeners who hear the way DSP measures *and* the way CLAP does.
 
 use std::collections::HashMap;
 
@@ -11,8 +12,28 @@ use dhunn_core::TrackId;
 use dhunn_dsp::DSP_VERSION;
 use dhunn_store::Store;
 
+use serde::{Deserialize, Serialize};
+
 use crate::rng::Rng;
 use crate::simulate::SimError;
+
+/// Which features a simulated listener's taste is defined in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TasteSpace {
+    #[default]
+    Dsp,
+    Clap,
+}
+
+impl TasteSpace {
+    pub fn name(self) -> &'static str {
+        match self {
+            TasteSpace::Dsp => "dsp",
+            TasteSpace::Clap => "clap",
+        }
+    }
+}
 
 pub struct Taste {
     pub ids: Vec<TrackId>,
@@ -69,7 +90,27 @@ pub fn skip_probability(affinity: f64) -> f64 {
 impl Taste {
     /// Draws `regions` home tracks at random from the library's analyzed tracks.
     pub fn hidden(store: &Store, rng: &mut Rng, regions: usize) -> Result<Self, SimError> {
-        let (_, rows) = store.feature_matrix("dsp", DSP_VERSION)?;
+        Self::hidden_in(store, TasteSpace::Dsp, rng, regions)
+    }
+
+    /// Like [`Taste::hidden`], in the given feature space.
+    pub fn hidden_in(
+        store: &Store,
+        kind: TasteSpace,
+        rng: &mut Rng,
+        regions: usize,
+    ) -> Result<Self, SimError> {
+        let rows: Vec<(TrackId, Vec<f32>)> = match kind {
+            TasteSpace::Dsp => store.feature_matrix("dsp", DSP_VERSION)?.1,
+            TasteSpace::Clap => {
+                let mut v: Vec<(TrackId, Vec<f32>)> = store
+                    .latest_embeddings(dhunn_index::CLAP_MODEL)?
+                    .into_iter()
+                    .collect();
+                v.sort_by_key(|r| r.0);
+                v
+            }
+        };
         if rows.len() < 10 {
             return Err(SimError::TooFewTracks(rows.len()));
         }

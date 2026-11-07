@@ -1,5 +1,6 @@
 //! `dhunn` — command-line front end for the dhunn recommendation engine.
 
+mod embed;
 mod eval;
 mod history;
 mod library;
@@ -65,6 +66,18 @@ enum Command {
         #[arg(short, long)]
         quiet: bool,
     },
+    /// Compute learned (CLAP) embeddings for analyzed tracks that don't have them yet.
+    Embed {
+        /// The exported CLAP model folder [default: $DHUNN_MODELS/clap, the data folder, or
+        /// ./models/clap].
+        #[arg(long)]
+        models: Option<PathBuf>,
+        /// Re-embed every track.
+        #[arg(long)]
+        force: bool,
+        #[arg(short, long)]
+        quiet: bool,
+    },
     /// Show what is in the library.
     Stats {
         /// How many recent failures to list.
@@ -96,6 +109,13 @@ enum Command {
     /// List the tracks that sound most like a song (search by title/artist words).
     Similar {
         query: String,
+        #[arg(short, default_value_t = 10)]
+        n: usize,
+    },
+    /// List the tracks that best match a description, e.g. "warm, slow and melancholic"
+    /// (needs `dhunn embed`).
+    Vibe {
+        text: String,
         #[arg(short, default_value_t = 10)]
         n: usize,
     },
@@ -145,6 +165,13 @@ enum Command {
         /// Name this run (shown when later runs compare against it).
         #[arg(long)]
         label: Option<String>,
+        /// Share of "sounds like" from learned (CLAP) embeddings, 0..1 [default: 0.25 when
+        /// embeddings exist].
+        #[arg(long)]
+        clap_share: Option<f32>,
+        /// Define the simulated listeners' tastes in DSP features or CLAP embeddings.
+        #[arg(long, value_enum, default_value_t = JudgeArg::Dsp)]
+        judge: JudgeArg,
         /// Don't save this run.
         #[arg(long)]
         no_save: bool,
@@ -156,6 +183,12 @@ enum Command {
         #[command(subcommand)]
         action: history::DevAction,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum JudgeArg {
+    Dsp,
+    Clap,
 }
 
 #[derive(Serialize)]
@@ -180,6 +213,11 @@ fn main() -> Result<()> {
             jobs,
             quiet,
         } => library::analyze(&library::db_path(db)?, &dir, force, jobs, quiet),
+        Command::Embed {
+            models,
+            force,
+            quiet,
+        } => embed::embed(&library::db_path(db)?, models.as_deref(), force, quiet),
         Command::Stats { failures } => library::stats(&library::db_path(db)?, failures),
         Command::User { action } => history::user(&library::db_path(db)?, action),
         Command::Import {
@@ -198,6 +236,8 @@ fn main() -> Result<()> {
             len,
             params,
             label,
+            clap_share,
+            judge,
             no_save,
             json,
         } => eval::eval(
@@ -210,10 +250,16 @@ fn main() -> Result<()> {
                 len,
                 params: &params,
                 label: label.as_deref(),
+                clap_share,
+                judge: match judge {
+                    JudgeArg::Dsp => dhunn_eval::TasteSpace::Dsp,
+                    JudgeArg::Clap => dhunn_eval::TasteSpace::Clap,
+                },
                 save: !no_save,
                 json,
             },
         ),
+        Command::Vibe { text, n } => listen::vibe(&library::db_path(db)?, &text, n),
         Command::Similar { query, n } => listen::similar(&library::db_path(db)?, &query, n),
         Command::Session { steer, len, rng } => {
             listen::session(&library::db_path(db)?, &steer, len, rng)

@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use dhunn_eval::{
-    ListenerConfig, ReplayConfig, Report, params_list, render, replay, simulated_listeners,
-    summarize,
+    ListenerConfig, ReplayConfig, Report, TasteSpace, params_list, render, replay,
+    simulated_listeners, summarize,
 };
 use dhunn_steer::{SessionConfig, SteerParams};
 
@@ -21,6 +21,10 @@ pub struct EvalOptions<'a> {
     /// `name=value` steering overrides.
     pub params: &'a [String],
     pub label: Option<&'a str>,
+    /// Share of "sounds like" from CLAP (`None` = the default).
+    pub clap_share: Option<f32>,
+    /// Which features the simulated listeners' tastes live in.
+    pub judge: TasteSpace,
     pub save: bool,
     pub json: bool,
 }
@@ -42,7 +46,15 @@ fn parse_params(items: &[String]) -> Result<SteerParams> {
 
 pub fn eval(db: &Path, opts: EvalOptions<'_>) -> Result<()> {
     let params = parse_params(opts.params)?;
-    let (mut store, space) = load(db)?;
+    let (mut store, _) = load(db)?;
+    let space = dhunn_index::SoundSpace::from_store_blended(
+        &store,
+        &dhunn_index::AspectWeights::default(),
+        opts.clap_share.unwrap_or(dhunn_index::DEFAULT_CLAP_SHARE),
+    )?;
+    if opts.judge == TasteSpace::Clap && !space.has_clap() {
+        bail!("--judge clap needs learned embeddings: run `dhunn embed` first");
+    }
     let user = resolve_user(&store, opts.user)?;
     let steer = SessionConfig {
         adventurousness: user.as_ref().map_or(0.5, |u| u.adventurousness),
@@ -79,6 +91,7 @@ pub fn eval(db: &Path, opts: EvalOptions<'_>) -> Result<()> {
                     sessions: opts.sessions,
                     length: opts.len,
                     steer: steer.clone(),
+                    judge: opts.judge,
                     ..Default::default()
                 },
             )
@@ -92,6 +105,7 @@ pub fn eval(db: &Path, opts: EvalOptions<'_>) -> Result<()> {
         created_at: now,
         label: opts.label.map(str::to_owned),
         library_tracks: space.len(),
+        clap_share: space.clap_share(),
         user: user.as_ref().map(|u| u.name.clone()),
         params: params_list(&params),
         replay,

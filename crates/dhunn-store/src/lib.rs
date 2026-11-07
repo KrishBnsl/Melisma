@@ -14,6 +14,7 @@ use std::{
 use dhunn_core::{FeatureVec, TrackId, TrackMeta, normalize_name};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
+mod embeddings;
 mod evals;
 mod history;
 mod sessions;
@@ -155,6 +156,15 @@ CREATE TABLE eval_runs (
     report     TEXT    NOT NULL
 );
 "#,
+    r#"
+CREATE TABLE embeddings (
+    track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+    model    TEXT    NOT NULL,
+    version  INTEGER NOT NULL,
+    vec      BLOB    NOT NULL,
+    PRIMARY KEY (track_id, model)
+);
+"#,
 ];
 
 /// Size and modification time of a file, used to detect changes without reading it.
@@ -220,11 +230,11 @@ pub(crate) fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-fn vec_to_blob(v: &[f32]) -> Vec<u8> {
+pub(crate) fn vec_to_blob(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
-fn blob_to_vec(b: &[u8]) -> Vec<f32> {
+pub(crate) fn blob_to_vec(b: &[u8]) -> Vec<f32> {
     let (chunks, _) = b.as_chunks::<4>();
     chunks.iter().map(|c| f32::from_le_bytes(*c)).collect()
 }
