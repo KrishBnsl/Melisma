@@ -3,6 +3,7 @@
 use dhunn_steer::SteerParams;
 use serde::{Deserialize, Serialize};
 
+use crate::friends::FriendReport;
 use crate::listeners::ListenerReport;
 use crate::logged::{Counts, LoggedReport};
 use crate::replay::ReplayReport;
@@ -20,6 +21,8 @@ pub struct Report {
     pub params: Vec<(String, f32)>,
     pub replay: Option<ReplayReport>,
     pub listeners: Option<ListenerReport>,
+    #[serde(default)]
+    pub friends: Option<FriendReport>,
     pub logged: Option<LoggedReport>,
 }
 
@@ -277,6 +280,53 @@ pub fn render(r: &Report, prev: Option<&Report>) -> String {
         }
     }
 
+    if let Some(f) = &r.friends {
+        let pf = prev.and_then(|p| p.friends.as_ref());
+        out.push_str(&format!(
+            "\nFriend groups: {} groups of three × {} sessions × {} tracks — A shares a home track with B, not with C (measured taste overlap {:.0}% and {:.0}%)\n\n",
+            f.groups,
+            f.sessions,
+            f.length,
+            f.overlap_b * 100.0,
+            f.overlap_c * 100.0
+        ));
+        let rows: Vec<Vec<String>> = f
+            .rows
+            .iter()
+            .map(|row| {
+                let p = pf.and_then(|p| p.rows.iter().find(|x| x.name == row.name));
+                vec![
+                    row.name.clone(),
+                    cell(row.taste, p.map(|p| p.taste), Fmt::Dec(1)),
+                    cell(row.skip, p.map(|p| p.skip), Fmt::Pct),
+                    cell(row.new_to_you, p.map(|p| p.new_to_you), Fmt::Pct),
+                    cell(
+                        row.friends_favourites,
+                        p.map(|p| p.friends_favourites),
+                        Fmt::Pct,
+                    ),
+                    cell(row.taste_b, p.map(|p| p.taste_b), Fmt::Dec(1)),
+                    cell(row.both, p.map(|p| p.both), Fmt::Dec(1)),
+                    cell(row.b_at_end, p.map(|p| p.b_at_end), Fmt::Dec(1)),
+                ]
+            })
+            .collect();
+        out.push_str(&table(
+            &[
+                "session",
+                "A's taste",
+                "skipped",
+                "new to A",
+                "friends' favourites",
+                "B's taste",
+                "suits both",
+                "B's taste at end",
+            ],
+            &rows,
+        ));
+        out.push_str("\n  suits both = mean of min(A's, B's taste percentile) per pick\n");
+    }
+
     match &r.logged {
         Some(g) => {
             out.push_str("\nYour dhunn sessions\n");
@@ -317,6 +367,7 @@ mod tests {
                 skip_model: None,
             }),
             listeners: None,
+            friends: None,
             logged: None,
         }
     }

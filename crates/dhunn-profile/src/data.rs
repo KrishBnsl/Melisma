@@ -38,8 +38,20 @@ pub fn history_sessions(plays: &[MatchedPlay], gap_s: i64) -> Vec<Vec<Obs>> {
 /// `dhunn play` sessions as observations (automated `smoke` sessions are left out). A skip
 /// in the first 30 s counts as not listened, like in imported history.
 pub fn logged_sessions(sessions: &[LoggedSession]) -> Vec<Vec<Obs>> {
+    observations(sessions, true)
+}
+
+/// Like [`logged_sessions`], without `--private` sessions: what friends may learn from.
+pub fn shared_sessions(sessions: &[LoggedSession]) -> Vec<Vec<Obs>> {
+    observations(sessions, false)
+}
+
+fn observations(sessions: &[LoggedSession], include_private: bool) -> Vec<Vec<Obs>> {
     let mut out = Vec::new();
-    for s in sessions.iter().filter(|s| s.mode != "smoke") {
+    for s in sessions
+        .iter()
+        .filter(|s| s.mode != "smoke" && (include_private || !s.private))
+    {
         let mut obs: Vec<Obs> = Vec::new();
         for e in &s.events {
             let Some(track) = e.track else { continue };
@@ -99,6 +111,7 @@ mod tests {
             id: 1,
             started_at: 100,
             mode: "drift".into(),
+            private: false,
             events: vec![
                 ev("play", 1, None),
                 ev("like", 1, Some(10_000)),
@@ -113,8 +126,16 @@ mod tests {
         };
         let smoke = LoggedSession {
             mode: "smoke".into(),
+            private: false,
             ..s.clone()
         };
+        let private = LoggedSession {
+            id: 3,
+            private: true,
+            ..s.clone()
+        };
+        assert_eq!(logged_sessions(std::slice::from_ref(&private)).len(), 1);
+        assert!(shared_sessions(&[private]).is_empty());
         let got = logged_sessions(&[s, smoke]);
         assert_eq!(got.len(), 1);
         let o = &got[0];

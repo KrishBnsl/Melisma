@@ -101,12 +101,14 @@ mod tests {
             id: 1,
             started_at: 0,
             mode: "drift".into(),
+            private: false,
             events: vec![ev("play", None), ev("complete", None)],
         };
         let new = LoggedSession {
             id: 2,
             started_at: 1_000_000,
             mode: "drift".into(),
+            private: false,
             events: vec![
                 ev("play", None),
                 ev("skip", Some(5_000)),
@@ -119,6 +121,7 @@ mod tests {
             id: 3,
             started_at: 1_000_050,
             mode: "smoke".into(),
+            private: false,
             events: vec![ev("play", None), ev("skip", Some(2_000))],
         };
         let r = summarize(&[old, new, smoke], 1_000_100).unwrap();

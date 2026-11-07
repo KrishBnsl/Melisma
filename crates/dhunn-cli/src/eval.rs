@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use dhunn_eval::{
-    ListenerConfig, ReplayConfig, Report, TasteSpace, params_list, render, replay,
-    simulated_listeners, summarize,
+    FriendConfig, ListenerConfig, ReplayConfig, Report, TasteSpace, friend_groups, params_list,
+    render, replay, simulated_listeners, summarize,
 };
 use dhunn_steer::{SessionConfig, SteerParams};
 
@@ -97,6 +97,22 @@ pub fn eval(db: &Path, opts: EvalOptions<'_>) -> Result<()> {
             )
         })
         .transpose()?;
+    let friends = (opts.listeners > 0 && opts.sessions > 0)
+        .then(|| {
+            friend_groups(
+                &store,
+                &space,
+                &FriendConfig {
+                    groups: (opts.listeners / 2).max(1),
+                    sessions: opts.sessions.min(4),
+                    length: opts.len,
+                    judge: opts.judge,
+                    steer: steer.clone(),
+                    ..Default::default()
+                },
+            )
+        })
+        .transpose()?;
     let logged = match &user {
         Some(u) => summarize(&store.logged_sessions(u.id)?, now),
         None => None,
@@ -110,6 +126,7 @@ pub fn eval(db: &Path, opts: EvalOptions<'_>) -> Result<()> {
         params: params_list(&params),
         replay,
         listeners,
+        friends,
         logged,
     };
 

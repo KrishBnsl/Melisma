@@ -11,6 +11,7 @@
 //! * **Dislikes** with no later like are remembered, so sessions never play them again.
 
 pub mod data;
+pub mod group;
 pub mod skip;
 
 use std::collections::{HashMap, HashSet};
@@ -18,7 +19,8 @@ use std::collections::{HashMap, HashSet};
 use dhunn_core::TrackId;
 use dhunn_index::{SoundSpace, dot, normalize};
 
-pub use data::{Obs, history_sessions, logged_sessions};
+pub use data::{Obs, history_sessions, logged_sessions, shared_sessions};
+pub use group::{Friend, beyond_me, friend_signal, meeting_point, overlap};
 pub use skip::{FEATURES, Retainer, SkipModel};
 
 #[derive(Debug, Clone)]

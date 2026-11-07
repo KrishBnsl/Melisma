@@ -135,6 +135,15 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Whether friends' recommendations may use this user's taste and listening.
+    pub fn set_share_profile(&mut self, user: UserId, share: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE users SET share_profile = ?2 WHERE id = ?1",
+            params![user.0 as i64, share],
+        )?;
+        Ok(())
+    }
+
     pub fn set_adventurousness(&mut self, user: UserId, value: f32) -> Result<()> {
         self.conn.execute(
             "UPDATE users SET adventurousness = ?2 WHERE id = ?1",

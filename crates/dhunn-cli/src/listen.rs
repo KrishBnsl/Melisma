@@ -17,7 +17,7 @@ use dhunn_core::TrackId;
 use dhunn_index::places::Places;
 use dhunn_index::{AspectWeights, SoundSpace};
 use dhunn_profile::{
-    Profile, ProfileConfig, Retainer, SkipModel, history_sessions, logged_sessions,
+    Friend, Profile, Retainer, SkipModel, beyond_me, friend_signal, meeting_point,
 };
 use dhunn_steer::{Feedback, Goal, Leg, Mode, Pick, Reason, Session, SessionConfig};
 use dhunn_store::{EventKind, SessionId, Store, User};
@@ -30,7 +30,8 @@ pub struct SteerArgs {
     /// Start from these songs (search words; repeatable). Default: your most-played.
     #[arg(long = "seed")]
     pub seeds: Vec<String>,
-    #[arg(long, short)]
+    /// Who is listening [default: $DHUNN_USER, or the only user].
+    #[arg(long, short, env = "DHUNN_USER")]
     pub user: Option<String>,
     /// Override the user's adventurousness (0..1) for this session.
     #[arg(long)]
@@ -45,6 +46,19 @@ pub struct SteerArgs {
     /// Travel toward a described sound, e.g. "rainy night drive" (needs `dhunn embed`).
     #[arg(long, conflicts_with = "to")]
     pub vibe: Option<String>,
+    /// Travel gradually into the part of this friend's taste you don't share yet.
+    #[arg(long, conflicts_with_all = ["to", "vibe"])]
+    pub friend: Option<String>,
+    /// Listening together (repeatable): picks must suit everyone, starting where your
+    /// tastes meet.
+    #[arg(long = "with")]
+    pub with: Vec<String>,
+    /// Ignore what friends love (no friend signal).
+    #[arg(long)]
+    pub solo: bool,
+    /// Keep this session out of what friends' recommendations learn from.
+    #[arg(long)]
+    pub private: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -58,7 +72,7 @@ pub enum ModeArg {
 /// Don't replay tracks heard in dhunn within this window.
 const RECENT_WINDOW_MS: i64 = 36 * 3600 * 1000;
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -141,7 +155,7 @@ pub(crate) fn name(store: &Store, t: TrackId) -> String {
 }
 
 /// "92 BPM · A minor" from the stored feature summary.
-fn facts(store: &Store, t: TrackId) -> String {
+pub(crate) fn facts(store: &Store, t: TrackId) -> String {
     let Some(json) = store
         .track_summary(t, "dsp", dhunn_dsp::DSP_VERSION)
         .ok()
@@ -191,18 +205,11 @@ pub(crate) fn know(
     user: Option<&User>,
 ) -> Result<Option<Known>> {
     let Some(u) = user else { return Ok(None) };
-    let mut sessions = history_sessions(&store.matched_plays(u.id)?, 30 * 60);
-    sessions.extend(logged_sessions(&store.logged_sessions(u.id)?));
+    let sessions = crate::friends::sessions_of(store, u, true)?;
     if sessions.is_empty() {
         return Ok(None);
     }
-    let profile = Profile::build(
-        space,
-        &sessions,
-        &store.primary_artists()?,
-        now_ms() / 1000,
-        &ProfileConfig::default(),
-    );
+    let profile = crate::friends::profile_from(store, space, &sessions)?;
     let model = SkipModel::train(space, &profile, &sessions);
     Ok(Some(Known { profile, model }))
 }
@@ -274,18 +281,62 @@ pub fn vibe(db: &Path, text: &str, n: usize) -> Result<()> {
     Ok(())
 }
 
+/// Friends whose taste this session may use (empty without a user).
+pub(crate) fn session_friends(
+    store: &Store,
+    space: &SoundSpace,
+    user: Option<&User>,
+    known: Option<&Known>,
+) -> Result<Vec<Friend>> {
+    match user {
+        Some(u) => crate::friends::friends_of(store, space, u, known.map(|k| &k.profile)),
+        None => Ok(Vec::new()),
+    }
+}
+
 fn session_config(
     store: &Store,
     space: &SoundSpace,
     user: Option<&User>,
     known: Option<&Known>,
+    friends: &[Friend],
     args: &SteerArgs,
     rng_seed: u64,
 ) -> Result<SessionConfig> {
     let adventure = args.adventure;
+    if user.is_none() && (args.friend.is_some() || !args.with.is_empty()) {
+        bail!("who's listening? pass --user <name> or set DHUNN_USER (see `dhunn user list`)");
+    }
+    let co: Vec<&Friend> = args
+        .with
+        .iter()
+        .map(|w| crate::friends::find_friend(store, friends, w))
+        .collect::<Result<_>>()?;
     let mode = match (&args.to, args.mode) {
         _ if args.vibe.is_some() => vibe_target(space, args.vibe.as_deref().unwrap_or(""))?.0,
         (Some(words), _) => destination(store, space, words)?,
+        _ if args.friend.is_some() => {
+            let f =
+                crate::friends::find_friend(store, friends, args.friend.as_deref().unwrap_or(""))?;
+            let me = known.map(|k| k.profile.clone()).unwrap_or_default();
+            Mode::Toward {
+                target: beyond_me(&me, &f.profile).context("they have no taste profile yet")?,
+                label: format!("{}'s taste", f.name),
+            }
+        }
+        (None, ModeArg::Drift) if !co.is_empty() => {
+            let me = known
+                .map(|k| &k.profile)
+                .context("a group session needs your own listening history first")?;
+            let group: Vec<&Profile> = std::iter::once(me)
+                .chain(co.iter().map(|f| &f.profile))
+                .collect();
+            let names: Vec<&str> = co.iter().map(|f| f.name.as_str()).collect();
+            Mode::Toward {
+                target: meeting_point(&group).context("no shared taste to start from")?,
+                label: format!("where you and {} meet", names.join(" and ")),
+            }
+        }
         (None, ModeArg::Drift) => Mode::Drift,
         (None, ModeArg::Usual) => Mode::Usual,
         (None, ModeArg::Surprise) => Mode::Surprise,
@@ -309,6 +360,12 @@ fn session_config(
             .map(|k| k.profile.tracks.keys().copied().collect())
             .unwrap_or_default(),
         mode,
+        friend_signal: if args.solo {
+            Default::default()
+        } else {
+            friend_signal(friends)
+        },
+        co_listeners: co.iter().map(|f| f.profile.centroids()).collect(),
         ..Default::default()
     })
 }
@@ -419,11 +476,13 @@ pub fn session(db: &Path, args: &SteerArgs, len: usize, rng_seed: u64) -> Result
     let user = resolve_user(&store, args.user.as_deref())?;
     let seed_ids = resolve_seeds(&store, &space, &args.seeds, user.as_ref())?;
     let known = know(&store, &space, user.as_ref())?;
+    let friends = session_friends(&store, &space, user.as_ref(), known.as_ref())?;
     let cfg = session_config(
         &store,
         &space,
         user.as_ref(),
         known.as_ref(),
+        &friends,
         args,
         rng_seed,
     )?;
@@ -452,13 +511,13 @@ pub fn session(db: &Path, args: &SteerArgs, len: usize, rng_seed: u64) -> Result
             println!("(library exhausted)");
             break;
         };
-        print_pick(&store, i, &p);
+        print_pick(&store, &friends, i, &p);
         sess.feedback(p.track, Feedback::Finished);
     }
     Ok(())
 }
 
-fn print_pick(store: &Store, i: usize, p: &Pick) {
+fn print_pick(store: &Store, friends: &[Friend], i: usize, p: &Pick) {
     println!(
         "{i:>3}. {}  [{}]",
         name(store, p.track),
@@ -467,6 +526,12 @@ fn print_pick(store: &Store, i: usize, p: &Pick) {
     let leg = leg_text(p.leg.as_ref());
     if !leg.is_empty() {
         println!("     {leg}");
+    }
+    if let Some(f) = p
+        .friend
+        .and_then(|(w, s)| crate::friends::friend_text(friends, w, s))
+    {
+        println!("     {f}");
     }
     if let Some(r) = &p.reason {
         println!("     {}{}", reason_text(store, r), keep_text(p));
@@ -538,11 +603,13 @@ pub fn play(db: &Path, args: &SteerArgs, smoke: Option<u64>) -> Result<()> {
     let user = resolve_user(&store, args.user.as_deref())?;
     let seed_ids = resolve_seeds(&store, &space, &args.seeds, user.as_ref())?;
     let known = know(&store, &space, user.as_ref())?;
+    let friends = session_friends(&store, &space, user.as_ref(), known.as_ref())?;
     let cfg = session_config(
         &store,
         &space,
         user.as_ref(),
         known.as_ref(),
+        &friends,
         args,
         now_ms() as u64,
     )?;
@@ -557,6 +624,9 @@ pub fn play(db: &Path, args: &SteerArgs, smoke: Option<u64>) -> Result<()> {
         "exploration": sess.exploration(),
         "to": args.to,
         "vibe": args.vibe,
+        "friend": args.friend,
+        "with": args.with,
+        "private": args.private,
     });
     // Automated audio checks are logged under their own mode so eval can ignore them.
     let mode = if smoke.is_some() {
@@ -627,6 +697,12 @@ pub fn play(db: &Path, args: &SteerArgs, smoke: Option<u64>) -> Result<()> {
         let leg = leg_text(pick.leg.as_ref());
         if !leg.is_empty() {
             line(&format!("  {leg}"));
+        }
+        if let Some(f) = pick
+            .friend
+            .and_then(|(w, s)| crate::friends::friend_text(&friends, w, s))
+        {
+            line(&format!("  {f}"));
         }
         if let Some(r) = &pick.reason {
             line(&format!(

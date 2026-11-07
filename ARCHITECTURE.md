@@ -190,7 +190,7 @@ Originally planned:
 - **Per user.** Every profile and session is keyed by `user_id`.
 - **Long-term taste:** weighted set of sound-space centroids (mixture, k≈3–8) learned from positive events and imported history with time decay; plus a "frontier" (regions touched but not settled); plus artist affinities (covers unowned artists from imported history).
 - **Adventurousness** a ∈ [0, 1] per user → default σ and `w_novel` (e.g. σ = σ_min + a·(σ_max − σ_min)).
-- **Friend profiles:** taste mixtures of other users who opted in (`share_profile`). Overlap between two mixtures defines "bridge" regions.
+- **Friend profiles — implemented (step 8, `dhunn-profile::group`):** built for every other user who shares their profile (`dhunn user set <name> --share yes|no`), from their history and their non-`--private` sessions. **Overlap** = how much of each taste lies close to some region of the other's (share × nearest-region similarity, averaged both ways; 0..1). **Trust** = 0.5 + 0.5 × overlap: any friend counts, closer ones more (with the first formula — products of region shares — two real people scored 2–5% and friends could never influence a pick).
 - **Session state:** last N tracks, current position (EMA of recent track vectors), velocity (direction of drift), recent reactions, exploration speed σ.
 - Updates are pure functions of `(state, event) → state` — easy to test and replay from the event log.
 
@@ -226,7 +226,14 @@ with `taste_weight` 0.5 and `retention_weight` 1.0. The profile's pull fades fas
 
 **Vibe — implemented (step 7):** `--vibe "rainy night drive"` embeds the text with CLAP, takes the 10 tracks whose CLAP vectors match it best, and travels to their (match-weighted) centre like any destination — a route of small steps from where you are, not a jump. `dhunn vibe "<text>"` lists the matches. On FMP: "heavy distorted rock guitars" → Nirvana, AC/DC, Apocalyptica, Metallica; "solo piano, calm" → Chopin Op. 28/4, Schumann Träumerei; "a crowd clapping" → the applause recordings; "drums only" fails (FMP has hardly any).
 
-**Still planned:** toward a friend and bridge (step 8), artist-graph edges in routes (step 9).
+**Friends — implemented (step 8):**
+- **Friend signal** in every session (unless `--solo`): `+ 0.3 × Σ_friends trust × affinity` (affinity = their time-decayed weight for the track, scaled so their 90th percentile = 1; skips and dislikes negative). It doesn't fade with exploration — friends are a good place to explore. Picks credit the friend: "Aarav plays this a lot" / "Aarav likes this".
+- **Toward a friend** (`--friend <name>`): destination = the friend's region scoring highest on share × (1 − closeness to my nearest region) — the part of their taste I don't have yet — reached by a planned route.
+- **Listening together** (`--with <name>`, repeatable): the taste term uses whoever a track suits *least*; with no other mode, the session starts by travelling to the meeting point (among all members' region centres and pairwise midpoints, the one whose weakest listener likes it most).
+- **`dhunn friends`:** overlaps, and friend-sourced novelty — tracks friends love that I've never played, ranked by friend signal × closeness to my taste.
+- **Privacy:** only users with `share_profile` are ever used; `--private` sessions count for the listener's own profile, never for friends.
+
+**Still planned:** artist-graph edges in routes (step 9).
 
 ## 8. Scoring (`dhunn-score`)
 
@@ -243,7 +250,7 @@ score = w_target · sim(track, step_point)
       - w_artist · same_artist_streak_penalty
 ```
 
-`friend_signal` is small-group collaborative filtering: no matrix factorization needed at ≤20 users — a weighted sum over friends of (their affinity for the track × overlap between their taste and mine). Weights come from mode presets + the user's adventurousness + a blend schedule (behavioral/friend weight grows with data). Final pick: sample from top-k with temperature (deterministic with seed for eval).
+`friend_signal` (implemented, §7) is small-group collaborative filtering: no matrix factorization needed at ≤20 users — a weighted sum over friends of (their affinity for the track × trust, from overlap between their taste and mine). Weights come from mode presets + the user's adventurousness + a blend schedule (behavioral/friend weight grows with data). Final pick: sample from top-k with temperature (deterministic with seed for eval).
 
 ## 9. Explanations (`dhunn-explain`)
 
@@ -252,7 +259,7 @@ Each pick returns structured `Reason`s → rendered text:
 - 1–2 named scalars with largest similarity to previous track (e.g. "similar tempo 84 BPM", "warm low end"),
 - steering context ("moving toward: neo-soul, step 3/6"),
 - graph link if used ("collaborated with X"),
-- friend context if used ("Aarav has this on repeat; close to your late-night stuff") — only from friends who share their profile.
+- friend context if used ("Aarav plays this a lot" ✅) — only from friends who share their profile.
 
 ## 10. Events & logging
 
@@ -341,6 +348,18 @@ The planned route gets there in ~8 tracks without a jarring jump, at the same sk
 
 0.25 has the best worst case (taste 83.8, skips 13.6%): DSP-like listeners lose almost nothing, CLAP-like listeners skip a quarter less. The history replay is simulated from DSP features too, so it leans the same way. Real listening (logged sessions) should settle it; `--clap-share` makes that a one-flag comparison.
 
+**Step 8 — friend groups** (8 groups of three; A shares one of two home tracks with B, none with C; 60 days of simulated history each; sessions start from A's favourites; adventurousness 0.5, 25% CLAP):
+
+| session | A's taste | skipped | friends' favourites | B's taste | suits both | B's taste at end |
+|---|---|---|---|---|---|---|
+| solo | 81.2 | 15.1% | 34.9% | 67.7 | 64.0 | 66.2 |
+| with friend signal | 80.5 | 14.6% | 51.6% | 73.3 | 67.8 | 70.8 |
+| toward friend B | 71.8 | 26.4% | 66.0% | 85.5 | 67.9 | 80.0 |
+| solo, B listening too | 80.2 | 37.9% | 38.1% | 70.7 | 65.6 | 68.5 |
+| bridge A + B | 77.6 | 32.1% | 44.0% | 79.1 | 74.1 | 77.4 |
+
+("Skipped" with two listeners = either one skips; "suits both" = mean of min(A's, B's percentile).) The friend signal makes half of all picks friends' favourites at no cost to A; "toward B" ends deep in B's taste (80) at the price of more skips on the way, as any journey out of one's taste does; the bridge suits both better (74 vs 66) and cuts joint skips. Measured overlap: A–B 65%, A–C 38% (random tastes aren't unrelated in sound). Eval now takes ~35 s.
+
 Planned: listening tests (export pairs of sessions from variants A and B as blind playlists; record preferences); steering-reach metrics once destinations exist.
 
 ## 12. CLI (`dhunn-cli`, clap)
@@ -355,9 +374,11 @@ dhunn history --user <name>          # ✅ match rates, top artists/tracks
 dhunn dev sample-history --out <dir> [--days N --seed S --regions K]  # ✅ simulated listener
 dhunn similar <song words> [-n 10]    # ✅ nearest tracks + which aspects they share
 dhunn session [--seed <song words>]... [--user] [--adventure A] [--mode drift|usual|surprise|new] [--to <song or artist> | --vibe "<description>"] [--len N] [--rng S]  # ✅ print a planned session
-dhunn play    (same steering options)  # ✅ listen: space pause · n next · l like · d dislike · f further · b back · s surprise me · ± volume · q quit
+dhunn play    (same steering options, plus --friend <name> · --with <name> · --solo · --private; user from --user or $DHUNN_USER)  # ✅ listen: space pause · n next · l like · d dislike · f further · b back · s surprise me · ± volume · q quit
 dhunn embed [--models DIR] [--force] [-q]   # ✅ CLAP embeddings for analyzed tracks (resumable)
 dhunn vibe "<description>" [-n 10]          # ✅ tracks that best match a description
+dhunn friends [--user] [-n 10]              # ✅ taste overlap with friends + what they love that you've never played
+dhunn user set <name> [--adventure A] [--share yes|no]   # ✅
 dhunn profile [--user]               # ✅ taste regions, dislikes, skip-model weights
 dhunn eval [--clap-share S] [--judge dsp|clap] [--user] [--holdout-days 14] [--listeners 16 --sessions 6 --len 25] [--param name=value]... [--label L] [--no-save] [--json]  # ✅ compared with the last run
 dhunn index                           # (not needed yet: the space is built at startup) clusters, artist graph
@@ -385,7 +406,7 @@ symphonia, rubato, realfft, ndarray, rayon, ort (ONNX Runtime), rusqlite, lofty,
 5. ✅ `eval`: next-track replay on history, simulated listeners with feedback, logged-session summary; runs saved and compared — baseline numbers in §11.
 6. ✅ (6a) `profile`: taste regions, dislikes, learned skip model, both mixed into steering; `dhunn profile`. ✅ (6b) modes: usual, surprise me, something new, toward a song/artist along a planned route; journey explanations; mode metrics in eval.
 7. ✅ `embed`: CLAP (music) exported to ONNX, `dhunn embed`, blended into the sound space at 25%, `--vibe` and `dhunn vibe`; eval under DSP- and CLAP-defined listeners.
-8. Friend modes (`friend`, `bridge`, `friend_signal`) once two or more users have imported history.
+8. ✅ Friends: overlap + trust, friend signal in every session, `--friend`, `--with` (bridge), `dhunn friends`, sharing switch, `--private`, `DHUNN_USER`; friend-group eval.
 9. `meta` (MusicBrainz + ListenBrainz graph), `discover`, interactive mode + event logging. HNSW only if exact search gets slow.
 
 ## 15. Decisions to revisit

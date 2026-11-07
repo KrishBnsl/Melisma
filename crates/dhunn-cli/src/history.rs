@@ -20,11 +20,15 @@ pub enum UserAction {
     },
     /// List everyone.
     List,
-    /// Change how adventurous recommendations are for someone.
+    /// Change someone's settings.
     Set {
         name: String,
+        /// How adventurous recommendations are (0..1).
         #[arg(long)]
-        adventure: f32,
+        adventure: Option<f32>,
+        /// Whether friends' recommendations may use this person's taste and listening.
+        #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
+        share: Option<bool>,
     },
 }
 
@@ -85,14 +89,31 @@ pub fn user(db: &Path, action: UserAction) -> Result<()> {
                 );
             }
         }
-        UserAction::Set { name, adventure } => {
+        UserAction::Set {
+            name,
+            adventure,
+            share,
+        } => {
             let u = require_user(&store, &name)?;
-            store.set_adventurousness(u.id, adventure)?;
-            println!(
-                "{}: adventurousness {:.2}",
-                u.name,
-                adventure.clamp(0.0, 1.0)
-            );
+            if adventure.is_none() && share.is_none() {
+                bail!("nothing to change: pass --adventure <0..1> and/or --share yes|no");
+            }
+            if let Some(a) = adventure {
+                store.set_adventurousness(u.id, a)?;
+                println!("{}: adventurousness {:.2}", u.name, a.clamp(0.0, 1.0));
+            }
+            if let Some(sh) = share {
+                store.set_share_profile(u.id, sh)?;
+                println!(
+                    "{}: {}",
+                    u.name,
+                    if sh {
+                        "shares their taste with friends"
+                    } else {
+                        "keeps their taste private"
+                    }
+                );
+            }
         }
     }
     Ok(())

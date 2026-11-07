@@ -168,6 +168,7 @@ fn eval_runs_on_simulated_history() {
         params: params_list(&SteerParams::default()),
         replay: Some(rep),
         listeners: Some(lis),
+        friends: None,
         logged: summarize(&store.logged_sessions(user).unwrap(), 0),
     };
     let text = render(&report, None);
@@ -208,4 +209,39 @@ fn listeners_can_be_judged_in_clap_space() {
     assert_eq!(lis.judge, dhunn_eval::TasteSpace::Clap);
     let r = |n: &str| lis.rows.iter().find(|r| r.name == n).unwrap();
     assert!(r("steer a=0.5").taste > r("random").taste + 10.0, "{lis:?}");
+}
+
+#[test]
+fn friend_modes_do_what_they_say() {
+    let store = library();
+    let space = SoundSpace::from_store(&store, &AspectWeights::default()).unwrap();
+    let rep = dhunn_eval::friend_groups(
+        &store,
+        &space,
+        &dhunn_eval::FriendConfig {
+            groups: 4,
+            sessions: 3,
+            length: 15,
+            steer: SessionConfig {
+                artist_of: store.primary_artists().unwrap(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(rep.groups > 0);
+    let r = |n: &str| rep.rows.iter().find(|x| x.name == n).unwrap();
+    assert!(
+        r("with friend signal").friends_favourites >= r("solo").friends_favourites,
+        "{rep:?}"
+    );
+    assert!(
+        r("toward friend B").b_at_end > r("solo").b_at_end,
+        "{rep:?}"
+    );
+    assert!(
+        r("bridge A + B").both > r("solo, B listening too").both,
+        "{rep:?}"
+    );
 }

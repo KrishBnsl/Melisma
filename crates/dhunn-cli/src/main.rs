@@ -2,6 +2,7 @@
 
 mod embed;
 mod eval;
+mod friends;
 mod history;
 mod library;
 mod listen;
@@ -137,15 +138,26 @@ enum Command {
         #[arg(long, hide = true)]
         smoke: Option<u64>,
     },
+    /// Who shares their taste with you, how close it is, and what they love that you've
+    /// never played.
+    Friends {
+        /// Who is listening [default: $DHUNN_USER, or the only user].
+        #[arg(long, short, env = "DHUNN_USER")]
+        user: Option<String>,
+        #[arg(short, default_value_t = 10)]
+        n: usize,
+    },
     /// Show what dhunn has learned about you: taste regions and the skip model.
     Profile {
-        #[arg(long, short)]
+        /// Who is listening [default: $DHUNN_USER, or the only user].
+        #[arg(long, short, env = "DHUNN_USER")]
         user: Option<String>,
     },
     /// Measure recommendation quality: next-track prediction on your history, simulated
     /// listeners, and your logged sessions. Each run is saved and compared with the last.
     Eval {
-        #[arg(long, short)]
+        /// Who is listening [default: $DHUNN_USER, or the only user].
+        #[arg(long, short, env = "DHUNN_USER")]
         user: Option<String>,
         /// Hold out the most recent N days of history for testing.
         #[arg(long, default_value_t = 14)]
@@ -227,6 +239,9 @@ fn main() -> Result<()> {
         } => history::import(&library::db_path(db)?, service, &path, &user),
         Command::History { user, top } => history::history(&library::db_path(db)?, &user, top),
         Command::Dev { action } => history::dev(&library::db_path(db)?, action),
+        Command::Friends { user, n } => {
+            friends::friends(&library::db_path(db)?, user.as_deref(), n)
+        }
         Command::Profile { user } => profile::profile(&library::db_path(db)?, user.as_deref()),
         Command::Eval {
             user,

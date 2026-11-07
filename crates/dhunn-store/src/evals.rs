@@ -31,6 +31,8 @@ pub struct LoggedSession {
     /// Unix seconds.
     pub started_at: i64,
     pub mode: String,
+    /// Started with `--private`: counts for the listener's own profile, never for friends.
+    pub private: bool,
     pub events: Vec<LoggedEvent>,
 }
 
@@ -64,7 +66,7 @@ impl Store {
     /// A user's `dhunn play` sessions, oldest first.
     pub fn logged_sessions(&self, user: UserId) -> Result<Vec<LoggedSession>> {
         let mut stmt = self.conn.prepare(
-            "SELECT s.id, s.started_at, s.mode, e.kind, e.track_id, e.position_ms
+            "SELECT s.id, s.started_at, s.mode, e.kind, e.track_id, e.position_ms, s.params
              FROM sessions s LEFT JOIN events e ON e.session_id = s.id
              WHERE s.user_id = ?1 ORDER BY s.id, e.id",
         )?;
@@ -73,10 +75,17 @@ impl Store {
         while let Some(r) = rows.next()? {
             let id = r.get::<_, i64>(0)? as u64;
             if out.last().is_none_or(|s| s.id != id) {
+                let params: Option<String> = r.get(6)?;
+                let private = params
+                    .as_deref()
+                    .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+                    .and_then(|v| v.get("private").and_then(serde_json::Value::as_bool))
+                    .unwrap_or(false);
                 out.push(LoggedSession {
                     id,
                     started_at: r.get(1)?,
                     mode: r.get(2)?,
+                    private,
                     events: Vec::new(),
                 });
             }
@@ -134,9 +143,11 @@ mod tests {
             .unwrap();
         s.log_event(a, Some(u), None, EventKind::Skip, Some(4_000), None)
             .unwrap();
-        s.start_session(Some(u), "drift", "{}").unwrap();
+        s.start_session(Some(u), "drift", r#"{"private":true}"#)
+            .unwrap();
         let got = s.logged_sessions(u).unwrap();
         assert_eq!(got.len(), 2);
+        assert!(!got[0].private && got[1].private);
         assert_eq!(got[0].events.len(), 2);
         assert_eq!(got[0].events[1].kind, "skip");
         assert_eq!(got[0].events[1].position_ms, Some(4_000));

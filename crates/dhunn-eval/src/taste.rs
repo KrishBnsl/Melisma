@@ -125,6 +125,17 @@ impl Taste {
                 homes.push(i);
             }
         }
+        let index = ids.iter().enumerate().map(|(i, &t)| (t, i)).collect();
+        Ok(Self::from_parts(ids, vecs, index, homes))
+    }
+
+    fn from_parts(
+        ids: Vec<TrackId>,
+        vecs: Vec<Vec<f32>>,
+        index: HashMap<TrackId, usize>,
+        homes: Vec<usize>,
+    ) -> Self {
+        let n = ids.len();
         let affinity: Vec<f64> = (0..n)
             .map(|i| {
                 homes
@@ -139,15 +150,30 @@ impl Taste {
         for (rank, &i) in order.iter().enumerate() {
             percentile[i] = rank as f64 / (n - 1).max(1) as f64;
         }
-        let index = ids.iter().enumerate().map(|(i, &t)| (t, i)).collect();
-        Ok(Self {
+        Self {
             ids,
             homes,
             affinity,
             percentile,
             vecs,
             index,
-        })
+        }
+    }
+
+    /// Another listener in the same feature space, with the given home tracks (indices into
+    /// `ids`) — for building friend groups whose tastes partly coincide.
+    pub fn with_homes(&self, homes: Vec<usize>) -> Self {
+        Self::from_parts(
+            self.ids.clone(),
+            self.vecs.clone(),
+            self.index.clone(),
+            homes,
+        )
+    }
+
+    /// The taste percentile (0..1) of a track, if it's in the library.
+    pub fn percentile_of(&self, t: TrackId) -> Option<f64> {
+        self.index_of(t).map(|i| self.percentile[i])
     }
 
     pub fn cosine(&self, a: usize, b: usize) -> f64 {

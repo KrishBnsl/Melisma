@@ -118,7 +118,7 @@ struct Known<'a> {
 }
 
 /// Library plays of a simulated history (the simulator tags them with the track id).
-fn library_plays(rows: &[ExtendedRow]) -> Vec<MatchedPlay> {
+pub(crate) fn library_plays(rows: &[ExtendedRow]) -> Vec<MatchedPlay> {
     rows.iter()
         .filter_map(|r| {
             let id = r

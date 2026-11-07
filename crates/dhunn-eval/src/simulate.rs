@@ -150,6 +150,17 @@ pub fn simulate_spotify_history(
 ) -> Result<(Vec<ExtendedRow>, GroundTruth, SimStats), SimError> {
     let mut rng = Rng::new(cfg.seed);
     let taste = Taste::hidden_in(store, cfg.taste_space, &mut rng, cfg.taste_regions)?;
+    simulate_with(store, cfg, &taste, &mut rng)
+}
+
+/// Simulates the history of a listener with a given hidden taste (e.g. one of a friend
+/// group), drawing from `rng`.
+pub fn simulate_with(
+    store: &Store,
+    cfg: &SimConfig,
+    taste: &Taste,
+    rng: &mut Rng,
+) -> Result<(Vec<ExtendedRow>, GroundTruth, SimStats), SimError> {
     let ids = taste.ids.clone();
 
     // Names and durations for every track.
@@ -212,7 +223,7 @@ pub fn simulate_spotify_history(
                         .unwrap_or_else(|| "Unknown Artist".to_owned());
                     let (artist, title) = if rng.chance(cfg.respell_share) {
                         stats.respelled += 1;
-                        respell(&mut rng, &artist, title)
+                        respell(rng, &artist, title)
                     } else {
                         (artist, title.clone())
                     };

@@ -49,6 +49,12 @@ pub struct SessionConfig {
     /// Plan journeys as routes of small steps (false = head straight for the goal; for
     /// evaluation).
     pub plan_route: bool,
+    /// Friends' signal per track (see `dhunn-profile::friend_signal`): strength −1..1 and
+    /// which friend it mostly comes from (an index the caller can name).
+    pub friend_signal: HashMap<TrackId, (f32, u32)>,
+    /// Taste centroids of the other people listening (a group / bridge session). The taste
+    /// term then uses the *least* happy listener, so picks suit everyone.
+    pub co_listeners: Vec<Vec<Vec<f32>>>,
 }
 
 /// Predicts whether the listener will keep listening to a candidate (the learned skip
@@ -79,6 +85,9 @@ pub struct SteerParams {
     pub taste_weight: f32,
     /// Weight of the skip model's P(listen) − 0.5 (scaled by 1 − exploration).
     pub retention_weight: f32,
+    /// Weight of the friend signal (friends' affinity × taste overlap). Doesn't fade with
+    /// exploration: friends are a good place to explore.
+    pub friend_weight: f32,
 }
 
 impl Default for SteerParams {
@@ -92,12 +101,13 @@ impl Default for SteerParams {
             like_pull: 0.4,
             taste_weight: 0.5,
             retention_weight: 1.0,
+            friend_weight: 0.3,
         }
     }
 }
 
 impl SteerParams {
-    pub const NAMES: [&'static str; 8] = [
+    pub const NAMES: [&'static str; 9] = [
         "smoothness",
         "onward",
         "heard_memory",
@@ -106,6 +116,7 @@ impl SteerParams {
         "like_pull",
         "taste_weight",
         "retention_weight",
+        "friend_weight",
     ];
 
     /// Sets one parameter by name; `Err` lists the valid names.
@@ -119,6 +130,7 @@ impl SteerParams {
             "like_pull" => self.like_pull = value.clamp(0.0, 1.0),
             "taste_weight" => self.taste_weight = value,
             "retention_weight" => self.retention_weight = value,
+            "friend_weight" => self.friend_weight = value,
             _ => {
                 return Err(format!(
                     "unknown steering parameter `{name}` (one of: {})",
@@ -144,6 +156,8 @@ impl Default for SessionConfig {
             mode: Mode::Drift,
             known: HashSet::new(),
             plan_route: true,
+            friend_signal: HashMap::new(),
+            co_listeners: Vec::new(),
         }
     }
 }
@@ -187,6 +201,9 @@ pub struct Pick {
     pub keep: Option<f32>,
     /// Where this pick is on a journey (surprise, something new, destination).
     pub leg: Option<Leg>,
+    /// The friend (index into the caller's friend list) whose love for this track helped
+    /// pick it, and how strongly (0..1).
+    pub friend: Option<(u32, f32)>,
 }
 
 /// Deterministic xorshift for pick sampling.
@@ -204,6 +221,8 @@ impl Rng {
 const AVOID_MEMORY: usize = 6;
 /// Bonus for tracks the listener has never played, in "something new" and surprises.
 const NOVELTY_BONUS: f32 = 0.3;
+/// Friend signal strong enough to mention in the explanation.
+const FRIEND_NOTE: f32 = 0.2;
 /// Exploration in "your usual".
 const USUAL_EXPLORATION: f32 = 0.05;
 
@@ -375,8 +394,17 @@ impl<'a> Session<'a> {
         self
     }
 
+    /// Closeness to the listener's taste — in a group session, to the taste of whoever it
+    /// suits least.
     fn taste_of(&self, v: &[f32]) -> Option<f32> {
-        self.cfg.taste.iter().map(|c| dot(c, v)).reduce(f32::max)
+        let of = |t: &[Vec<f32>]| t.iter().map(|c| dot(c, v)).reduce(f32::max);
+        let mine = of(&self.cfg.taste);
+        self.cfg
+            .co_listeners
+            .iter()
+            .filter_map(|t| of(t))
+            .chain(mine)
+            .reduce(f32::min)
     }
 
     pub fn exploration(&self) -> f32 {
@@ -462,6 +490,7 @@ impl<'a> Session<'a> {
                     .sum::<f32>()
                     * p.avoid_penalty;
                 let taste = self.taste_of(v).unwrap_or(0.0);
+                let friends = self.cfg.friend_signal.get(&t).map_or(0.0, |f| f.0);
                 let keep = self
                     .retention
                     .map_or(0.5, |r| r.listen_probability(&self.history, t));
@@ -476,6 +505,7 @@ impl<'a> Session<'a> {
                 let score = (1.0 - e) * sim + smoothness * smooth - e * familiar - penalty
                     + taste_weight * home * home * taste
                     + p.retention_weight * home * (keep - 0.5)
+                    + p.friend_weight * friends
                     + new;
                 (rank, t, sim, score)
             })
@@ -562,6 +592,12 @@ impl<'a> Session<'a> {
             exploration: e,
             reason: self.reason(track),
             taste: self.taste_of(v),
+            friend: self
+                .cfg
+                .friend_signal
+                .get(&track)
+                .filter(|f| f.0 >= FRIEND_NOTE)
+                .map(|f| (f.1, f.0)),
             keep: self
                 .retention
                 .map(|r| r.listen_probability(&self.history[..self.history.len() - 1], track)),
@@ -1093,5 +1129,70 @@ mod tests {
         let hop = sess.next_pick().unwrap();
         assert!(hop.leg.unwrap().hop);
         assert!(dist(hop.track, before[2].track) >= 10);
+    }
+
+    #[test]
+    fn friends_favourites_come_up_sooner() {
+        let s = ring();
+        let v = |t: u64| s.vector(TrackId(t)).unwrap().to_vec();
+        let base = SessionConfig {
+            adventurousness: 0.3,
+            taste: vec![v(10)],
+            ..Default::default()
+        };
+        let friendly = SessionConfig {
+            friend_signal: (14..=17).map(|t| (TrackId(t), (0.9, 0))).collect(),
+            ..base.clone()
+        };
+        let first_friend_pick = |cfg: SessionConfig| {
+            let mut sess = Session::new(&s, &[TrackId(10)], cfg).unwrap();
+            let picks = run(&mut sess, 15);
+            picks
+                .iter()
+                .position(|p| (14..=17).contains(&p.track.0))
+                .unwrap_or(99)
+        };
+        assert!(first_friend_pick(friendly.clone()) < first_friend_pick(base));
+        let mut sess = Session::new(&s, &[TrackId(10)], friendly).unwrap();
+        let p = run(&mut sess, 15)
+            .into_iter()
+            .find(|p| (14..=17).contains(&p.track.0))
+            .unwrap();
+        assert_eq!(p.friend, Some((0, 0.9)), "the friend is credited");
+    }
+
+    #[test]
+    fn group_sessions_suit_the_least_happy_listener() {
+        let s = ring();
+        let v = |t: u64| s.vector(TrackId(t)).unwrap().to_vec();
+        let me = vec![v(5)];
+        let them = vec![vec![v(15)]];
+        let cfg = SessionConfig {
+            adventurousness: 0.0,
+            taste: me.clone(),
+            params: SteerParams {
+                taste_weight: 3.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let group = SessionConfig {
+            co_listeners: them,
+            ..cfg.clone()
+        };
+        // Starting at the meeting point (10): alone I drift toward 5; together we stay
+        // between us.
+        let mean_dist_to_mid = |c: SessionConfig| {
+            let mut sess = Session::new(&s, &[TrackId(10)], c).unwrap();
+            let picks = run(&mut sess, 6);
+            picks
+                .iter()
+                .map(|p| dist(p.track, TrackId(10)) as f32)
+                .sum::<f32>()
+                / 6.0
+        };
+        let alone = mean_dist_to_mid(cfg);
+        let together = mean_dist_to_mid(group);
+        assert!(together <= alone, "together {together}, alone {alone}");
     }
 }
