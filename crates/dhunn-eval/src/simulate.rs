@@ -18,6 +18,7 @@ use dhunn_store::{Store, StoreError};
 use serde::{Deserialize, Serialize};
 
 use crate::rng::Rng;
+use crate::taste::{Taste, skip_probability};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SimError {
@@ -123,40 +124,6 @@ const UNOWNED: &[(&str, &str, u32)] = &[
     ("Four Tet", "Baby", 259),
 ];
 
-fn zscore(rows: &mut [Vec<f32>]) {
-    let Some(dims) = rows.first().map(Vec::len) else {
-        return;
-    };
-    for d in 0..dims {
-        let n = rows.len() as f64;
-        let mean = rows.iter().map(|r| r[d] as f64).sum::<f64>() / n;
-        let sd = (rows
-            .iter()
-            .map(|r| (r[d] as f64 - mean).powi(2))
-            .sum::<f64>()
-            / n)
-            .sqrt();
-        let sd = if sd > 1e-9 { sd } else { 1.0 };
-        for r in rows.iter_mut() {
-            r[d] = ((r[d] as f64 - mean) / sd) as f32;
-        }
-    }
-}
-
-fn cosine(a: &[f32], b: &[f32]) -> f64 {
-    let (mut ab, mut aa, mut bb) = (0f64, 0f64, 0f64);
-    for (&x, &y) in a.iter().zip(b) {
-        ab += x as f64 * y as f64;
-        aa += x as f64 * x as f64;
-        bb += y as f64 * y as f64;
-    }
-    if aa == 0.0 || bb == 0.0 {
-        0.0
-    } else {
-        ab / (aa.sqrt() * bb.sqrt())
-    }
-}
-
 /// Re-spells a library title/artist the way a streaming service might list it.
 fn respell(rng: &mut Rng, artist: &str, title: &str) -> (String, String) {
     match rng.int(0, 3) {
@@ -177,13 +144,9 @@ pub fn simulate_spotify_history(
     store: &Store,
     cfg: &SimConfig,
 ) -> Result<(Vec<ExtendedRow>, GroundTruth, SimStats), SimError> {
-    let (_, rows) = store.feature_matrix("dsp", DSP_VERSION)?;
-    if rows.len() < 10 {
-        return Err(SimError::TooFewTracks(rows.len()));
-    }
-    let ids: Vec<TrackId> = rows.iter().map(|r| r.0).collect();
-    let mut vecs: Vec<Vec<f32>> = rows.into_iter().map(|r| r.1).collect();
-    zscore(&mut vecs);
+    let mut rng = Rng::new(cfg.seed);
+    let taste = Taste::hidden(store, &mut rng, cfg.taste_regions)?;
+    let ids = taste.ids.clone();
 
     // Names and durations for every track.
     let mut meta = Vec::with_capacity(ids.len());
@@ -194,23 +157,8 @@ pub fn simulate_spotify_history(
         meta.push((t.artists.first().cloned(), t.title, t.album, t.duration_s));
     }
 
-    let mut rng = Rng::new(cfg.seed);
     let n = ids.len();
-    let mut homes: Vec<usize> = Vec::new();
-    while homes.len() < cfg.taste_regions.clamp(1, n) {
-        let i = rng.int(0, n as i64 - 1) as usize;
-        if !homes.contains(&i) {
-            homes.push(i);
-        }
-    }
-    let affinity: Vec<f64> = (0..n)
-        .map(|i| {
-            homes
-                .iter()
-                .map(|&h| cosine(&vecs[i], &vecs[h]))
-                .fold(f64::MIN, f64::max)
-        })
-        .collect();
+    let (homes, affinity) = (&taste.homes, &taste.affinity);
     let base_weight: Vec<f64> = affinity
         .iter()
         .map(|a| (a / cfg.temperature).exp())
@@ -246,7 +194,7 @@ pub fn simulate_spotify_history(
                         Some(p) => (0..n)
                             .map(|i| {
                                 base_weight[i]
-                                    * ((cosine(&vecs[i], &vecs[p]) * 0.5) / cfg.temperature).exp()
+                                    * ((taste.cosine(i, p) * 0.5) / cfg.temperature).exp()
                             })
                             .collect(),
                         None => base_weight.clone(),
@@ -268,7 +216,7 @@ pub fn simulate_spotify_history(
                     (artist, title, album.clone(), *dur, affinity[i], uri)
                 };
                 // Skips get likely as affinity drops.
-                let p_skip = (1.0 / (1.0 + ((aff - 0.15) * 8.0).exp())).clamp(0.03, 0.9);
+                let p_skip = skip_probability(aff);
                 let skipped = rng.chance(p_skip);
                 let dur_ms = (dur_s * 1000.0) as i64;
                 let ms_played = if skipped {
@@ -310,7 +258,7 @@ pub fn simulate_spotify_history(
 
     let mut ranked: Vec<(TrackId, f32)> = ids
         .iter()
-        .zip(&affinity)
+        .zip(affinity)
         .map(|(&t, &a)| (t, a as f32))
         .collect();
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1));

@@ -33,6 +33,68 @@ pub struct SessionConfig {
     /// Song identity per track: tracks with the same key are versions of one song (a FLAC
     /// and an MP3, a remaster) and are never both played in a session.
     pub song_of: HashMap<TrackId, u64>,
+    pub params: SteerParams,
+}
+
+/// The steering model's tunable constants (what `dhunn eval --param` changes).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SteerParams {
+    /// Weight of similarity to the previous track, relative to similarity to the anchor.
+    pub smoothness: f32,
+    /// How far past the current track "further" moves the anchor, as a multiple of the
+    /// step from what was heard before to the current track.
+    pub onward: f32,
+    /// How many recent tracks define "already heard".
+    pub heard_memory: usize,
+    /// How strongly candidates near recent skips are penalized.
+    pub avoid_penalty: f32,
+    /// How far a finished track pulls the anchor toward itself.
+    pub finish_pull: f32,
+    /// How far a liked track pulls the anchor toward itself.
+    pub like_pull: f32,
+}
+
+impl Default for SteerParams {
+    fn default() -> Self {
+        Self {
+            smoothness: 1.0,
+            onward: 1.0,
+            heard_memory: 15,
+            avoid_penalty: 0.5,
+            finish_pull: 0.2,
+            like_pull: 0.4,
+        }
+    }
+}
+
+impl SteerParams {
+    pub const NAMES: [&'static str; 6] = [
+        "smoothness",
+        "onward",
+        "heard_memory",
+        "avoid_penalty",
+        "finish_pull",
+        "like_pull",
+    ];
+
+    /// Sets one parameter by name; `Err` lists the valid names.
+    pub fn set(&mut self, name: &str, value: f32) -> Result<(), String> {
+        match name {
+            "smoothness" => self.smoothness = value,
+            "onward" => self.onward = value,
+            "heard_memory" => self.heard_memory = value.max(1.0).round() as usize,
+            "avoid_penalty" => self.avoid_penalty = value,
+            "finish_pull" => self.finish_pull = value.clamp(0.0, 1.0),
+            "like_pull" => self.like_pull = value.clamp(0.0, 1.0),
+            _ => {
+                return Err(format!(
+                    "unknown steering parameter `{name}` (one of: {})",
+                    Self::NAMES.join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for SessionConfig {
@@ -44,6 +106,7 @@ impl Default for SessionConfig {
             artist_of: HashMap::new(),
             max_artist_run: 2,
             song_of: HashMap::new(),
+            params: SteerParams::default(),
         }
     }
 }
@@ -96,13 +159,6 @@ impl Rng {
 }
 
 const AVOID_MEMORY: usize = 6;
-/// Weight of similarity to the previous track, relative to similarity to the anchor.
-const SMOOTHNESS: f32 = 1.0;
-/// How far past the current track "further" moves the anchor, as a multiple of the step
-/// from what was heard before to the current track.
-const ONWARD: f32 = 1.0;
-/// How many recent tracks define "already heard".
-const HEARD_MEMORY: usize = 15;
 
 pub struct Session<'a> {
     space: &'a SoundSpace,
@@ -181,27 +237,25 @@ impl<'a> Session<'a> {
         run >= self.cfg.max_artist_run
     }
 
-    /// Chooses the next track, or `None` when everything has been played or excluded.
-    pub fn next_pick(&mut self) -> Option<Pick> {
+    /// Candidates for the next track, best first: `(rank by anchor similarity, track,
+    /// anchor similarity, score)`. Artist-run limits are not applied here.
+    fn scored(&self, pool: usize) -> Vec<(usize, TrackId, f32, f32)> {
         let fresh = |t: TrackId| {
             !self.heard_songs.contains(&song_key(&self.cfg, t)) && !self.banned.contains(&t)
         };
         let available = |t: TrackId| fresh(t) && !self.cfg.exclude.contains(&t);
         let e = self.exploration.clamp(0.0, 1.0);
-        let pool = 60 + (e * 140.0) as usize;
         let mut cands = self.space.nearest(&self.anchor, pool, available);
         if cands.is_empty() {
             // Fall back to anything not played in this session (exclusions relaxed).
             cands = self.space.nearest(&self.anchor, pool, fresh);
-        }
-        if cands.is_empty() {
-            return None;
         }
         // Score = closeness to the anchor (less as exploration rises)
         //       + continuity with the track just played (keeps the session moving one way)
         //       − closeness to what was already heard (more as exploration rises: this is
         //         what makes the session drift toward new sound instead of circling)
         //       − closeness to recent skips.
+        let p = &self.cfg.params;
         let last = self
             .played
             .last()
@@ -212,7 +266,7 @@ impl<'a> Session<'a> {
             .iter()
             .chain(&self.played)
             .rev()
-            .take(HEARD_MEMORY)
+            .take(p.heard_memory)
             .map(|&t| (t, 1.0))
             .collect();
         let heard = self.space.centroid(&heard);
@@ -231,12 +285,43 @@ impl<'a> Session<'a> {
                     .iter()
                     .map(|(a, w)| w * dot(a, v).max(0.0))
                     .sum::<f32>()
-                    * 0.5;
-                let score = (1.0 - e) * sim + SMOOTHNESS * smooth - e * familiar - penalty;
+                    * p.avoid_penalty;
+                let score = (1.0 - e) * sim + p.smoothness * smooth - e * familiar - penalty;
                 (rank, t, sim, score)
             })
             .collect();
         scored.sort_by(|a, b| b.3.total_cmp(&a.3).then(a.1.cmp(&b.1)));
+        scored
+    }
+
+    fn pool(&self) -> usize {
+        60 + (self.exploration.clamp(0.0, 1.0) * 140.0) as usize
+    }
+
+    /// The best `k` next tracks by score, without sampling (for evaluation): what
+    /// `next_pick` chooses among.
+    pub fn ranked(&self, k: usize) -> Vec<(TrackId, f32)> {
+        self.scored(self.pool().max(k))
+            .into_iter()
+            .take(k)
+            .map(|c| (c.1, c.3))
+            .collect()
+    }
+
+    /// Records that `track` played without this session choosing it (replaying history,
+    /// or the listener picking a track themselves). Follow with `feedback`.
+    pub fn observe(&mut self, track: TrackId) {
+        self.played.push(track);
+        self.heard_songs.insert(song_key(&self.cfg, track));
+    }
+
+    /// Chooses the next track, or `None` when everything has been played or excluded.
+    pub fn next_pick(&mut self) -> Option<Pick> {
+        let e = self.exploration.clamp(0.0, 1.0);
+        let scored = self.scored(self.pool());
+        if scored.is_empty() {
+            return None;
+        }
         let ok: Vec<&(usize, TrackId, f32, f32)> = scored
             .iter()
             .filter(|c| !self.artist_run_blocks(c.1))
@@ -315,15 +400,16 @@ impl<'a> Session<'a> {
             .chain(&self.played)
             .filter(|&&t| t != track)
             .rev()
-            .take(HEARD_MEMORY)
+            .take(self.cfg.params.heard_memory)
             .map(|&t| (t, 1.0))
             .collect();
+        let onward = self.cfg.params.onward;
         match self.space.centroid(&before) {
             Some(h) => {
                 self.anchor = v
                     .iter()
                     .zip(&h)
-                    .map(|(x, y)| x + ONWARD * (x - y))
+                    .map(|(x, y)| x + onward * (x - y))
                     .collect();
                 normalize(&mut self.anchor);
             }
@@ -344,14 +430,14 @@ impl<'a> Session<'a> {
     pub fn feedback(&mut self, track: TrackId, fb: Feedback) {
         match fb {
             Feedback::Finished => {
-                self.pull(track, 0.2);
+                self.pull(track, self.cfg.params.finish_pull);
                 self.positives.push(track);
                 // Settle slowly back toward the user's usual exploration.
                 self.exploration += (self.base_exploration - self.exploration) * 0.1;
             }
             Feedback::Like => {
                 self.anchor_stack.push(self.anchor.clone());
-                self.pull(track, 0.4);
+                self.pull(track, self.cfg.params.like_pull);
                 if !self.positives.contains(&track) {
                     self.positives.push(track);
                 }

@@ -1,5 +1,6 @@
 //! `dhunn` — command-line front end for the dhunn recommendation engine.
 
+mod eval;
 mod history;
 mod library;
 mod listen;
@@ -127,6 +128,35 @@ enum Command {
         #[arg(long, hide = true)]
         smoke: Option<u64>,
     },
+    /// Measure recommendation quality: next-track prediction on your history, simulated
+    /// listeners, and your logged sessions. Each run is saved and compared with the last.
+    Eval {
+        #[arg(long, short)]
+        user: Option<String>,
+        /// Hold out the most recent N days of history for testing.
+        #[arg(long, default_value_t = 14)]
+        holdout_days: u32,
+        /// Simulated listeners (0 to skip the simulation).
+        #[arg(long, default_value_t = 16)]
+        listeners: usize,
+        /// Sessions per simulated listener.
+        #[arg(long, default_value_t = 6)]
+        sessions: usize,
+        /// Tracks per simulated session.
+        #[arg(long, default_value_t = 25)]
+        len: usize,
+        /// Try a steering parameter: name=value (repeatable), e.g. smoothness=0.5.
+        #[arg(long = "param")]
+        params: Vec<String>,
+        /// Name this run (shown when later runs compare against it).
+        #[arg(long)]
+        label: Option<String>,
+        /// Don't save this run.
+        #[arg(long)]
+        no_save: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Developer tools.
     Dev {
         #[command(subcommand)]
@@ -165,6 +195,30 @@ fn main() -> Result<()> {
         } => history::import(&library::db_path(db)?, service, &path, &user),
         Command::History { user, top } => history::history(&library::db_path(db)?, &user, top),
         Command::Dev { action } => history::dev(&library::db_path(db)?, action),
+        Command::Eval {
+            user,
+            holdout_days,
+            listeners,
+            sessions,
+            len,
+            params,
+            label,
+            no_save,
+            json,
+        } => eval::eval(
+            &library::db_path(db)?,
+            eval::EvalOptions {
+                user: user.as_deref(),
+                holdout_days,
+                listeners,
+                sessions,
+                len,
+                params: &params,
+                label: label.as_deref(),
+                save: !no_save,
+                json,
+            },
+        ),
         Command::Similar { query, n } => listen::similar(&library::db_path(db)?, &query, n),
         Command::Session {
             seeds,

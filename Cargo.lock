@@ -464,9 +464,12 @@ dependencies = [
  "dhunn-core",
  "dhunn-dsp",
  "dhunn-import",
+ "dhunn-index",
+ "dhunn-steer",
  "dhunn-store",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
 ]
 

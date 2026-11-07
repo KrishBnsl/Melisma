@@ -41,7 +41,7 @@ dhunn/
 │   ├── dhunn-steer/           # sessions: next pick + feedback (basic drift model ✅); later modes, trajectory planning
 │   ├── dhunn-score/           # candidate scoring + blending weights
 │   ├── dhunn-explain/         # human-readable reasons
-│   ├── dhunn-eval/            # simulated listeners ✅; offline metrics, A/B session export
+│   ├── dhunn-eval/            # simulated listeners, history replay, simulated sessions, logged-session summary ✅; later A/B session export
 │   └── dhunn-cli/             # `dhunn` binary
 ├── ml/                        # Python: model export to ONNX, later fine-tuning
 ├── models/                    # .onnx files (git-ignored, fetched by script)
@@ -113,6 +113,13 @@ history_plays(id, user_id, ts, source, raw_artist, raw_title, raw_album, ms_play
 sessions(id, user_id, started_at, ended_at, mode, params JSON)
 events(id, session_id, user_id, ts_ms, track_id, kind, position_ms, payload JSON, schema_version)
        -- kind: play | complete | skip | like | dislike | further | back | pause | resume | quit | error
+       -- mode: drift | smoke (automated audio check; ignored by eval)
+```
+
+**Implemented** (migration 4):
+
+```
+eval_runs(id, created_at, label, report JSON)   -- every `dhunn eval` run, so the next one shows changes
 ```
 
 **Planned** (later migrations, with the steps that need them):
@@ -228,13 +235,41 @@ Each pick returns structured `Reason`s → rendered text:
 
 Originally planned: every CLI action emits an `Event` (play, skip{at_ms}, complete, replay, like, dislike, never, more_like, further, back, too_far, vibe_set) to the store. Signals only a real player can produce (volume changes, seek) get event kinds reserved now and are emitted once the apps exist. Profile/session state can be rebuilt by replaying events. Versioned schema from day one.
 
-## 11. Evaluation (`dhunn-eval`)
+## 11. Evaluation (`dhunn-eval`) — *implemented (step 5)*
 
-- **Real data first:** imported Spotify history (with `skipped`, `ms_played`, `reason_end`) restricted to tracks matched in the library gives real sessions; split by time (train on older, hold out the most recent weeks).
-- **Offline:** given those, event logs or public datasets (e.g. sessions over FMA tracks), compute hit-rate@k / NDCG@k for next-track, skip-prediction AUC, transition smoothness, novelty, diversity, long-tail coverage, repetition rate, steering reach (target reached? max hop ≤ σ?).
-- **Simulated users:** synthetic listeners with hidden taste regions + skip models (✅ implemented, see §4a), to regression-test steering before real users exist; their ground truth gives "did we recommend what they like" metrics.
-- **Listening tests:** export pairs of sessions (variant A vs B) as blind playlists; record preferences.
-- `dhunn eval --config variants.toml` prints a comparison table; every algorithm change runs it.
+`dhunn eval` runs three checks in about 2 s on a 500-track library, prints them, saves the report to `eval_runs` and shows every number's change since the previous run in brackets. `--param name=value` tries a steering constant without changing code (`SteerParams`: smoothness, onward, heard_memory, avoid_penalty, finish_pull, like_pull); `--label` names a run.
+
+1. **Next-track prediction on history** (`replay`). The user's matched plays are split by time: the last `--holdout-days` (14) are test, the rest train. Test plays are cut into sessions (pause > 30 min). At each step every model ranks the whole library given the session so far, and we record where the next *listened* track landed (hit@10, hit@50, MRR; skipped tracks aren't targets but still feed the session, as in reality). Models: random (analytic), popular (train listens), your taste (centroid of train listens), previous track (nearest by sound), steer (`Session::ranked` with the real plays observed and finished/skipped fed back). Plus skip AUC: how well taste similarity and previous-track similarity separate listens from skips.
+2. **Simulated listeners** (`listeners`). Listeners with hidden tastes (`taste.rs`: home tracks in plain z-scored DSP space, *not* the recommender's weighted space) start sessions from one of their top-5% tracks; every pick is "played" to them and they skip / finish / like / dislike by affinity, which is fed back. Pickers: random, nearest chain (always the closest unplayed track to the last one), steer at adventurousness 0.2/0.5/0.8. Metrics: taste percentile of picks, skip and like rate, smooth (mean consecutive similarity), worst hop, travel (1 − similarity of the last pick to the start), per-listener variety, same-artist pairs. 16 listeners × 6 sessions × 25 tracks by default; run-to-run noise is about ±1–2 taste points, so smaller differences mean nothing.
+3. **Your dhunn sessions** (`logged`): plays, skip rate (and skips in the first 30 s), likes, dislikes, further/back, all time and last 7 days — the number that matters once the app is used daily.
+
+**Baseline** (FMP library, 479 tracks, sample history of 2,154 plays, default parameters):
+
+| next track (113 predictions) | hit@10 | hit@50 | MRR |
+|---|---|---|---|
+| random | 2.1% | 10.5% | 0.011 |
+| popular | 65.5% | 83.2% | 0.287 |
+| your taste | 38.1% | 71.7% | 0.116 |
+| previous track | 42.5% | 63.7% | 0.186 |
+| steer | 42.5% | 52.2% | 0.187 |
+
+Skip AUC: your taste 0.84, previous track 0.74.
+
+| simulated sessions | taste | skipped | liked | smooth | worst hop | travel | variety |
+|---|---|---|---|---|---|---|---|
+| random | 51.0 | 46.0% | 2.7% | 0.01 | −0.50 | 0.98 | 86.7% |
+| nearest chain | 79.4 | 16.4% | 12.8% | 0.83 | 0.61 | 0.69 | 47.1% |
+| steer a=0.2 | 82.7 | 13.8% | 12.0% | 0.79 | 0.52 | 0.65 | 58.5% |
+| steer a=0.5 | 82.3 | 14.6% | 12.4% | 0.79 | 0.48 | 0.68 | 60.4% |
+| steer a=0.8 | 78.2 | 17.5% | 11.2% | 0.77 | 0.41 | 0.72 | 67.0% |
+
+What it says:
+- Steering's feedback works: it beats always-play-the-nearest on taste (+3), skips (about 2 points fewer) and variety (+11 to +20 points), at a small cost in smoothness.
+- **Adventurousness barely changes how far a session travels** (0.65 → 0.72) while costing taste. `heard_memory=40` makes it work (a=0.8 travels 0.85) for similar cost — the first tuning candidate.
+- **Steering ignores long-term taste**: on history, "popular" and "your taste" beat it at hit@50 because the session only knows its seeds and what it played. Mixing the profile in is step 6.
+- Caveats: the history is simulated (its listener picks by previous-track similarity and replays favourites, which flatters those two models); the simulated listeners' taste comes from the same DSP features the recommender uses. Real history and logged sessions are the arbiters. Same-artist pairs can't be measured on FMP (9 of 479 tracks have artist tags).
+
+Planned: listening tests (export pairs of sessions from variants A and B as blind playlists; record preferences); steering-reach metrics once destinations exist.
 
 ## 12. CLI (`dhunn-cli`, clap)
 
@@ -249,6 +284,7 @@ dhunn dev sample-history --out <dir> [--days N --seed S --regions K]  # ✅ simu
 dhunn similar <song words> [-n 10]    # ✅ nearest tracks + which aspects they share
 dhunn session [--seed <song words>]... [--user] [--len N] [--adventure A] [--rng S]  # ✅ print a planned session
 dhunn play [--seed <song words>]... [--user] [--adventure A]  # ✅ listen: space pause · n next · l like · d dislike · f further · b back · ± volume · q quit
+dhunn eval [--user] [--holdout-days 14] [--listeners 16 --sessions 6 --len 25] [--param name=value]... [--label L] [--no-save] [--json]  # ✅ compared with the last run
 dhunn index                           # (not needed yet: the space is built at startup) clusters, artist graph
 dhunn mb-sync                         # optional MusicBrainz/ListenBrainz matching (rate-limited)
 dhunn session --user <name>
@@ -257,7 +293,6 @@ dhunn session --user <name>
              [--adventure 0.7] --len 20 [--interactive]
 dhunn discover --user <name>          # unowned suggestions (ListenBrainz + history gaps)
 dhunn explain <track>
-dhunn eval [--config variants.toml]
 dhunn inspect <track>                 # dump features
 ```
 `--interactive` plays nothing in M1 (or optionally via `rodio`) but accepts keys: s=skip, l=like, f=further, b=back, t=too far — all logged.
@@ -272,7 +307,7 @@ symphonia, rubato, realfft, ndarray, rayon, ort (ONNX Runtime), rusqlite, lofty,
 2. ✅ `store`, `meta` (tags), `analysis`, `analyze` + `stats` commands.
 3. ✅ `import` (Spotify extended + basic, Apple best-effort) + track matching + simulated-listener sample data.
 4. ✅ `index` (exact, aspect-weighted) + basic steering session + **`dhunn play`** (rodio playback, keyboard controls, event logging) — pulled forward so the app can be used daily and real feedback accumulates.
-5. `eval` on imported history + simulated users — baseline numbers.
+5. ✅ `eval`: next-track replay on history, simulated listeners with feedback, logged-session summary; runs saved and compared — baseline numbers in §11.
 6. `profile` (per user, adventurousness) + `steer` (drift, destination) + `explain`.
 7. `embed` (CLAP + audio model) → vibe text, surprise/new modes; re-run eval.
 8. Friend modes (`friend`, `bridge`, `friend_signal`) once two or more users have imported history.

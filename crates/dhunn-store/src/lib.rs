@@ -14,8 +14,10 @@ use std::{
 use dhunn_core::{FeatureVec, TrackId, TrackMeta, normalize_name};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
+mod evals;
 mod history;
 mod sessions;
+pub use evals::*;
 pub use history::*;
 pub use sessions::*;
 
@@ -144,6 +146,14 @@ CREATE TABLE events (
 );
 CREATE INDEX events_by_user_ts ON events(user_id, ts_ms);
 CREATE INDEX events_by_session ON events(session_id);
+"#,
+    r#"
+CREATE TABLE eval_runs (
+    id         INTEGER PRIMARY KEY,
+    created_at INTEGER NOT NULL,
+    label      TEXT,
+    report     TEXT    NOT NULL
+);
 "#,
 ];
 

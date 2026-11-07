@@ -1,0 +1,275 @@
+//! Simulated listeners reacting to live sessions.
+//!
+//! Each listener has a hidden taste (see [`crate::taste`]). A session starts from one of
+//! their favourite tracks; every pick is played to them, and they skip, finish, like or
+//! dislike it according to how much they like it. The recommender only sees those
+//! reactions, as it would with a real person. All pickers get the same listeners and the
+//! same starting tracks.
+
+use std::collections::HashSet;
+
+use dhunn_core::TrackId;
+use dhunn_index::SoundSpace;
+use dhunn_steer::{Feedback, Session, SessionConfig};
+use dhunn_store::Store;
+use serde::{Deserialize, Serialize};
+
+use crate::rng::Rng;
+use crate::simulate::SimError;
+use crate::taste::{Taste, skip_probability};
+
+#[derive(Debug, Clone)]
+pub struct ListenerConfig {
+    pub listeners: usize,
+    pub sessions: usize,
+    pub length: usize,
+    pub seed: u64,
+    /// Steering is run once per adventurousness level.
+    pub adventure_levels: Vec<f32>,
+    /// Base steering configuration (artist/song keys, parameters).
+    pub steer: SessionConfig,
+}
+
+impl Default for ListenerConfig {
+    fn default() -> Self {
+        Self {
+            listeners: 16,
+            sessions: 6,
+            length: 25,
+            seed: 7,
+            adventure_levels: vec![0.2, 0.5, 0.8],
+            steer: SessionConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionRow {
+    pub name: String,
+    /// Mean taste percentile of the picks (100 = the listener's favourite, 50 = average).
+    pub taste: f64,
+    pub skip: f64,
+    pub like: f64,
+    /// Mean sound similarity between consecutive tracks (the seed included).
+    pub smooth: f64,
+    /// Mean over sessions of the least similar consecutive pair: the session's worst jump.
+    pub worst_hop: f64,
+    /// Mean `1 − similarity(last pick, seed)`: how far sessions travel from where they began.
+    pub travel: f64,
+    /// Per listener, distinct tracks over all their picks: low = the same tracks every
+    /// session.
+    pub variety: f64,
+    /// Share of consecutive picks by the same primary artist.
+    pub same_artist: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ListenerReport {
+    pub listeners: usize,
+    pub sessions: usize,
+    pub length: usize,
+    pub rows: Vec<SessionRow>,
+}
+
+#[derive(Clone, Copy)]
+enum Picker {
+    Random,
+    Nearest,
+    Steer(f32),
+}
+
+impl Picker {
+    fn name(self) -> String {
+        match self {
+            Picker::Random => "random".into(),
+            Picker::Nearest => "nearest chain".into(),
+            Picker::Steer(a) => format!("steer a={a:.1}"),
+        }
+    }
+}
+
+#[derive(Default)]
+struct Acc {
+    picks: usize,
+    taste: f64,
+    skips: usize,
+    likes: usize,
+    hops: f64,
+    hop_n: usize,
+    worst: f64,
+    travel: f64,
+    sessions: usize,
+    same_artist: usize,
+    pairs: usize,
+    /// Distinct tracks for the current listener.
+    distinct: HashSet<TrackId>,
+    /// Sum over listeners of distinct tracks.
+    distinct_total: usize,
+}
+
+/// Picks of one session under `picker`, with the listener's reactions fed back.
+#[allow(clippy::too_many_arguments)]
+fn run_session(
+    space: &SoundSpace,
+    taste: &Taste,
+    picker: Picker,
+    seed_track: TrackId,
+    length: usize,
+    base: &SessionConfig,
+    rng_seed: u64,
+    acc: &mut Acc,
+) {
+    let mut react = Rng::new(rng_seed);
+    let mut choose = Rng::new(rng_seed ^ 0xA5A5);
+    let key = |t: TrackId| base.song_of.get(&t).copied().unwrap_or(t.0 | (1 << 63));
+    let mut heard: HashSet<u64> = [key(seed_track)].into();
+    let mut session = match picker {
+        Picker::Steer(a) => Session::new(
+            space,
+            &[seed_track],
+            SessionConfig {
+                adventurousness: a,
+                seed: rng_seed | 1,
+                ..base.clone()
+            },
+        ),
+        _ => None,
+    };
+    let mut prev = seed_track;
+    let mut worst = f64::INFINITY;
+    let mut last = None;
+    for _ in 0..length {
+        let pick = match picker {
+            Picker::Random => {
+                let avail: Vec<TrackId> = space
+                    .ids()
+                    .iter()
+                    .copied()
+                    .filter(|&t| !heard.contains(&key(t)))
+                    .collect();
+                avail
+                    .get(choose.int(0, avail.len() as i64 - 1).max(0) as usize)
+                    .copied()
+            }
+            Picker::Nearest => space.vector(prev).map(<[f32]>::to_vec).and_then(|v| {
+                space
+                    .nearest(&v, 1, |t| !heard.contains(&key(t)))
+                    .first()
+                    .map(|x| x.0)
+            }),
+            Picker::Steer(_) => session
+                .as_mut()
+                .and_then(|s| s.next_pick())
+                .map(|p| p.track),
+        };
+        let Some(t) = pick else { break };
+        heard.insert(key(t));
+        let Some(i) = taste.index_of(t) else { break };
+        let (aff, pct) = (taste.affinity[i], taste.percentile[i]);
+
+        // The listener reacts.
+        let fb = if react.chance(skip_probability(aff)) {
+            acc.skips += 1;
+            if pct < 0.15 && react.chance(0.3) {
+                Feedback::Dislike
+            } else {
+                Feedback::Skipped {
+                    at: react.range(0.03, 0.3) as f32,
+                }
+            }
+        } else if pct >= 0.95 && react.chance(0.5) {
+            acc.likes += 1;
+            Feedback::Like
+        } else {
+            Feedback::Finished
+        };
+        if let Some(s) = session.as_mut() {
+            if fb == Feedback::Like {
+                s.feedback(t, Feedback::Finished);
+            }
+            s.feedback(t, fb);
+        }
+
+        let hop = space.similarity(prev, t) as f64;
+        acc.hops += hop;
+        acc.hop_n += 1;
+        worst = worst.min(hop);
+        if let (Some(a), Some(b)) = (base.artist_of.get(&prev), base.artist_of.get(&t)) {
+            acc.same_artist += usize::from(a == b);
+        }
+        acc.pairs += 1;
+        acc.picks += 1;
+        acc.taste += pct;
+        acc.distinct.insert(t);
+        prev = t;
+        last = Some(t);
+    }
+    if let Some(l) = last {
+        acc.sessions += 1;
+        acc.worst += worst;
+        acc.travel += 1.0 - space.similarity(l, seed_track) as f64;
+    }
+}
+
+pub fn simulated_listeners(
+    store: &Store,
+    space: &SoundSpace,
+    cfg: &ListenerConfig,
+) -> Result<ListenerReport, SimError> {
+    let mut pickers = vec![Picker::Random, Picker::Nearest];
+    pickers.extend(cfg.adventure_levels.iter().map(|&a| Picker::Steer(a)));
+    let mut accs: Vec<Acc> = pickers.iter().map(|_| Acc::default()).collect();
+
+    for l in 0..cfg.listeners {
+        let lseed = cfg.seed.wrapping_mul(1_000_003).wrapping_add(l as u64);
+        let mut rng = Rng::new(lseed);
+        let taste = Taste::hidden(store, &mut rng, 2)?;
+        let favs: Vec<TrackId> = taste
+            .favourites(0.05)
+            .into_iter()
+            .filter(|&t| space.contains(t))
+            .collect();
+        if favs.is_empty() {
+            continue;
+        }
+        for s in 0..cfg.sessions {
+            let seed_track = *rng.pick(&favs);
+            let run_seed = lseed.wrapping_mul(31).wrapping_add(s as u64 + 1);
+            for (p, acc) in pickers.iter().zip(&mut accs) {
+                run_session(
+                    space, &taste, *p, seed_track, cfg.length, &cfg.steer, run_seed, acc,
+                );
+            }
+        }
+        for acc in &mut accs {
+            acc.distinct_total += acc.distinct.len();
+            acc.distinct.clear();
+        }
+    }
+
+    let rows = pickers
+        .iter()
+        .zip(&accs)
+        .map(|(p, a)| {
+            let picks = a.picks.max(1) as f64;
+            let sessions = a.sessions.max(1) as f64;
+            SessionRow {
+                name: p.name(),
+                taste: 100.0 * a.taste / picks,
+                skip: a.skips as f64 / picks,
+                like: a.likes as f64 / picks,
+                smooth: a.hops / a.hop_n.max(1) as f64,
+                worst_hop: a.worst / sessions,
+                travel: a.travel / sessions,
+                variety: a.distinct_total as f64 / picks,
+                same_artist: a.same_artist as f64 / a.pairs.max(1) as f64,
+            }
+        })
+        .collect();
+    Ok(ListenerReport {
+        listeners: cfg.listeners,
+        sessions: cfg.sessions,
+        length: cfg.length,
+        rows,
+    })
+}

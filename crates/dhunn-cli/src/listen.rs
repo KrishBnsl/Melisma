@@ -32,7 +32,7 @@ fn now_ms() -> i64 {
 
 /// The store plus the sound space built from it. Kept as two values so a session can
 /// borrow the space while the player writes events to the store.
-fn load(db: &Path) -> Result<(Store, SoundSpace)> {
+pub(crate) fn load(db: &Path) -> Result<(Store, SoundSpace)> {
     let store = open(db)?;
     let space = SoundSpace::from_store(&store, &AspectWeights::default())?;
     if space.len() < 2 {
@@ -45,7 +45,7 @@ fn load(db: &Path) -> Result<(Store, SoundSpace)> {
 }
 
 /// The named user, or the only user if there is exactly one.
-fn resolve_user(store: &Store, name: Option<&str>) -> Result<Option<User>> {
+pub(crate) fn resolve_user(store: &Store, name: Option<&str>) -> Result<Option<User>> {
     match name {
         Some(n) => match store.user_by_name(n)? {
             Some(u) => Ok(Some(u)),
@@ -161,7 +161,7 @@ fn session_config(
 
 /// One key per song (normalized primary artist + title), so different files or versions
 /// of the same song aren't both played in a session.
-fn song_keys(store: &Store) -> Result<std::collections::HashMap<TrackId, u64>> {
+pub(crate) fn song_keys(store: &Store) -> Result<std::collections::HashMap<TrackId, u64>> {
     use std::hash::{Hash, Hasher};
     let mut out = std::collections::HashMap::new();
     for e in store.library_entries()? {
@@ -328,8 +328,13 @@ pub fn play(db: &Path, opts: PlayOptions<'_>) -> Result<()> {
         "seeds": seed_ids.iter().map(|t| t.0).collect::<Vec<_>>(),
         "exploration": sess.exploration(),
     });
-    let session_id =
-        store.start_session(user.as_ref().map(|u| u.id), "drift", &params.to_string())?;
+    // Automated audio checks are logged under their own mode so eval can ignore them.
+    let mode = if opts.smoke.is_some() {
+        "smoke"
+    } else {
+        "drift"
+    };
+    let session_id = store.start_session(user.as_ref().map(|u| u.id), mode, &params.to_string())?;
     let mut p = Player {
         store: &mut store,
         session: session_id,
