@@ -34,6 +34,17 @@ pub struct SessionConfig {
     /// and an MP3, a remaster) and are never both played in a session.
     pub song_of: HashMap<TrackId, u64>,
     pub params: SteerParams,
+    /// The listener's long-term taste: unit-vector centroids in the sound space (empty =
+    /// no profile). Picks close to any of them score higher, less so as exploration rises.
+    pub taste: Vec<Vec<f32>>,
+}
+
+/// Predicts whether the listener will keep listening to a candidate (the learned skip
+/// model lives in `dhunn-profile`; steering only needs this view of it).
+pub trait Retention: Sync {
+    /// `history`: this session's tracks so far, oldest first, with whether each was
+    /// listened to (seeds count as listened). Returns P(listen) in 0..1.
+    fn listen_probability(&self, history: &[(TrackId, bool)], candidate: TrackId) -> f32;
 }
 
 /// The steering model's tunable constants (what `dhunn eval --param` changes).
@@ -52,6 +63,10 @@ pub struct SteerParams {
     pub finish_pull: f32,
     /// How far a liked track pulls the anchor toward itself.
     pub like_pull: f32,
+    /// Weight of closeness to the listener's long-term taste (scaled by (1 − exploration)²).
+    pub taste_weight: f32,
+    /// Weight of the skip model's P(listen) − 0.5 (scaled by 1 − exploration).
+    pub retention_weight: f32,
 }
 
 impl Default for SteerParams {
@@ -63,18 +78,22 @@ impl Default for SteerParams {
             avoid_penalty: 0.5,
             finish_pull: 0.2,
             like_pull: 0.4,
+            taste_weight: 0.5,
+            retention_weight: 1.0,
         }
     }
 }
 
 impl SteerParams {
-    pub const NAMES: [&'static str; 6] = [
+    pub const NAMES: [&'static str; 8] = [
         "smoothness",
         "onward",
         "heard_memory",
         "avoid_penalty",
         "finish_pull",
         "like_pull",
+        "taste_weight",
+        "retention_weight",
     ];
 
     /// Sets one parameter by name; `Err` lists the valid names.
@@ -86,6 +105,8 @@ impl SteerParams {
             "avoid_penalty" => self.avoid_penalty = value,
             "finish_pull" => self.finish_pull = value.clamp(0.0, 1.0),
             "like_pull" => self.like_pull = value.clamp(0.0, 1.0),
+            "taste_weight" => self.taste_weight = value,
+            "retention_weight" => self.retention_weight = value,
             _ => {
                 return Err(format!(
                     "unknown steering parameter `{name}` (one of: {})",
@@ -107,6 +128,7 @@ impl Default for SessionConfig {
             max_artist_run: 2,
             song_of: HashMap::new(),
             params: SteerParams::default(),
+            taste: Vec::new(),
         }
     }
 }
@@ -144,6 +166,10 @@ pub struct Pick {
     pub rank: usize,
     pub exploration: f32,
     pub reason: Option<Reason>,
+    /// Closeness to the listener's long-term taste (max over taste centroids), if known.
+    pub taste: Option<f32>,
+    /// The skip model's P(listen), if a model is attached.
+    pub keep: Option<f32>,
 }
 
 /// Deterministic xorshift for pick sampling.
@@ -172,6 +198,9 @@ pub struct Session<'a> {
     avoid: Vec<(Vec<f32>, f32)>,
     banned: HashSet<TrackId>,
     played: Vec<TrackId>,
+    /// Seeds and played tracks with whether each was listened to (for the skip model).
+    history: Vec<(TrackId, bool)>,
+    retention: Option<&'a dyn Retention>,
     /// Songs already heard in this session (seeds included), by `song_of` key or track id.
     heard_songs: HashSet<u64>,
     rng: Rng,
@@ -210,10 +239,27 @@ impl<'a> Session<'a> {
             avoid: Vec::new(),
             banned: HashSet::new(),
             played: Vec::new(),
+            history: seeds
+                .iter()
+                .copied()
+                .filter(|&t| space.contains(t))
+                .map(|t| (t, true))
+                .collect(),
+            retention: None,
             heard_songs,
             rng: Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1),
             cfg,
         })
+    }
+
+    /// Attaches a skip model: candidates the listener is likely to skip score lower.
+    pub fn with_retention(mut self, model: &'a dyn Retention) -> Self {
+        self.retention = Some(model);
+        self
+    }
+
+    fn taste_of(&self, v: &[f32]) -> Option<f32> {
+        self.cfg.taste.iter().map(|c| dot(c, v)).reduce(f32::max)
     }
 
     pub fn exploration(&self) -> f32 {
@@ -286,7 +332,16 @@ impl<'a> Session<'a> {
                     .map(|(a, w)| w * dot(a, v).max(0.0))
                     .sum::<f32>()
                     * p.avoid_penalty;
-                let score = (1.0 - e) * sim + p.smoothness * smooth - e * familiar - penalty;
+                let taste = self.taste_of(v).unwrap_or(0.0);
+                let keep = self
+                    .retention
+                    .map_or(0.5, |r| r.listen_probability(&self.history, t));
+                // The pull of long-term taste fades fast as exploration rises: an adventurous
+                // listener (or one who pressed "further") isn't dragged back home.
+                let home = 1.0 - e;
+                let score = (1.0 - e) * sim + p.smoothness * smooth - e * familiar - penalty
+                    + p.taste_weight * home * home * taste
+                    + p.retention_weight * home * (keep - 0.5);
                 (rank, t, sim, score)
             })
             .collect();
@@ -312,6 +367,7 @@ impl<'a> Session<'a> {
     /// or the listener picking a track themselves). Follow with `feedback`.
     pub fn observe(&mut self, track: TrackId) {
         self.played.push(track);
+        self.history.push((track, true));
         self.heard_songs.insert(song_key(&self.cfg, track));
     }
 
@@ -346,6 +402,8 @@ impl<'a> Session<'a> {
         }
         let &(rank, track, similarity, _) = ok[idx];
         self.played.push(track);
+        self.history.push((track, true));
+        let v = self.space.vector(track).expect("picked from the space");
         self.heard_songs.insert(song_key(&self.cfg, track));
         Some(Pick {
             track,
@@ -353,6 +411,10 @@ impl<'a> Session<'a> {
             rank,
             exploration: e,
             reason: self.reason(track),
+            taste: self.taste_of(v),
+            keep: self
+                .retention
+                .map(|r| r.listen_probability(&self.history[..self.history.len() - 1], track)),
         })
     }
 
@@ -426,6 +488,12 @@ impl<'a> Session<'a> {
         }
     }
 
+    fn mark_skipped(&mut self, track: TrackId) {
+        if let Some(h) = self.history.iter_mut().rev().find(|h| h.0 == track) {
+            h.1 = false;
+        }
+    }
+
     /// Updates the session after the listener reacts to `track`.
     pub fn feedback(&mut self, track: TrackId, fb: Feedback) {
         match fb {
@@ -443,6 +511,10 @@ impl<'a> Session<'a> {
                 }
             }
             Feedback::Skipped { at } => {
+                // Past halfway, a skip is "enough of this", not "not this".
+                if at < 0.5 {
+                    self.mark_skipped(track);
+                }
                 // An early skip is a clear "not this"; a late skip barely says anything.
                 let weight = (1.0 - at.clamp(0.0, 1.0)).powi(2);
                 if weight > 0.2 {
@@ -451,6 +523,7 @@ impl<'a> Session<'a> {
                 }
             }
             Feedback::Dislike => {
+                self.mark_skipped(track);
                 self.remember_avoid(track, 2.0);
                 self.banned.insert(track);
                 self.positives.retain(|&p| p != track);

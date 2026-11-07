@@ -10,6 +10,7 @@ dhunn-core.workspace = true
 dhunn-dsp.workspace = true
 dhunn-import.workspace = true
 dhunn-index.workspace = true
+dhunn-profile.workspace = true
 dhunn-steer.workspace = true
 dhunn-store.workspace = true
 serde.workspace = true

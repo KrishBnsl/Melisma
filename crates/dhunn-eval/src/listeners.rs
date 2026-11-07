@@ -5,17 +5,23 @@
 //! dislike it according to how much they like it. The recommender only sees those
 //! reactions, as it would with a real person. All pickers get the same listeners and the
 //! same starting tracks.
+//!
+//! Before its sessions, each listener gets 60 days of simulated history from the same hidden
+//! taste; steering builds the listener's profile and skip model from it, as it would from an
+//! imported Spotify history. "no profile" rows show steering without that knowledge.
 
 use std::collections::HashSet;
 
 use dhunn_core::TrackId;
+use dhunn_import::{spotify::ExtendedRow, time::parse_timestamp};
 use dhunn_index::SoundSpace;
+use dhunn_profile::{Profile, ProfileConfig, Retainer, SkipModel, history_sessions};
 use dhunn_steer::{Feedback, Session, SessionConfig};
-use dhunn_store::Store;
+use dhunn_store::{MatchedPlay, Store};
 use serde::{Deserialize, Serialize};
 
 use crate::rng::Rng;
-use crate::simulate::SimError;
+use crate::simulate::{SimConfig, SimError, simulate_spotify_history};
 use crate::taste::{Taste, skip_probability};
 
 #[derive(Debug, Clone)]
@@ -71,11 +77,38 @@ pub struct ListenerReport {
     pub rows: Vec<SessionRow>,
 }
 
+/// What steering knows about a listener: their profile (in `cfg.taste`) and skip model.
+struct Known<'a> {
+    cfg: SessionConfig,
+    retainer: Option<Retainer<'a>>,
+}
+
+/// Library plays of a simulated history (the simulator tags them with the track id).
+fn library_plays(rows: &[ExtendedRow]) -> Vec<MatchedPlay> {
+    rows.iter()
+        .filter_map(|r| {
+            let id = r
+                .spotify_track_uri
+                .as_deref()?
+                .strip_prefix("spotify:track:dhunnsim")?
+                .parse()
+                .ok()?;
+            Some(MatchedPlay {
+                ts: parse_timestamp(&r.ts)?,
+                track: TrackId(id),
+                ms_played: r.ms_played,
+                listened: !r.skipped.unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
 #[derive(Clone, Copy)]
 enum Picker {
     Random,
     Nearest,
-    Steer(f32),
+    /// Adventurousness, and whether the listener's profile and skip model are used.
+    Steer(f32, bool),
 }
 
 impl Picker {
@@ -83,7 +116,8 @@ impl Picker {
         match self {
             Picker::Random => "random".into(),
             Picker::Nearest => "nearest chain".into(),
-            Picker::Steer(a) => format!("steer a={a:.1}"),
+            Picker::Steer(a, true) => format!("steer a={a:.1}"),
+            Picker::Steer(a, false) => format!("steer a={a:.1}, no profile"),
         }
     }
 }
@@ -116,6 +150,7 @@ fn run_session(
     seed_track: TrackId,
     length: usize,
     base: &SessionConfig,
+    known: &Known<'_>,
     rng_seed: u64,
     acc: &mut Acc,
 ) {
@@ -124,15 +159,22 @@ fn run_session(
     let key = |t: TrackId| base.song_of.get(&t).copied().unwrap_or(t.0 | (1 << 63));
     let mut heard: HashSet<u64> = [key(seed_track)].into();
     let mut session = match picker {
-        Picker::Steer(a) => Session::new(
-            space,
-            &[seed_track],
-            SessionConfig {
+        Picker::Steer(a, with_profile) => {
+            let cfg = SessionConfig {
                 adventurousness: a,
                 seed: rng_seed | 1,
-                ..base.clone()
-            },
-        ),
+                ..if with_profile {
+                    known.cfg.clone()
+                } else {
+                    base.clone()
+                }
+            };
+            let s = Session::new(space, &[seed_track], cfg);
+            match (&known.retainer, with_profile) {
+                (Some(r), true) => s.map(|s| s.with_retention(r)),
+                _ => s,
+            }
+        }
         _ => None,
     };
     let mut prev = seed_track;
@@ -157,7 +199,7 @@ fn run_session(
                     .first()
                     .map(|x| x.0)
             }),
-            Picker::Steer(_) => session
+            Picker::Steer(..) => session
                 .as_mut()
                 .and_then(|s| s.next_pick())
                 .map(|p| p.track),
@@ -217,13 +259,44 @@ pub fn simulated_listeners(
     cfg: &ListenerConfig,
 ) -> Result<ListenerReport, SimError> {
     let mut pickers = vec![Picker::Random, Picker::Nearest];
-    pickers.extend(cfg.adventure_levels.iter().map(|&a| Picker::Steer(a)));
+    pickers.extend(cfg.adventure_levels.iter().map(|&a| Picker::Steer(a, true)));
+    pickers.push(Picker::Steer(0.5, false));
     let mut accs: Vec<Acc> = pickers.iter().map(|_| Acc::default()).collect();
 
     for l in 0..cfg.listeners {
         let lseed = cfg.seed.wrapping_mul(1_000_003).wrapping_add(l as u64);
         let mut rng = Rng::new(lseed);
         let taste = Taste::hidden(store, &mut rng, 2)?;
+        // The listener's past: the same hidden taste, simulated as 60 days of history.
+        let (rows, _, _) = simulate_spotify_history(
+            store,
+            &SimConfig {
+                seed: lseed,
+                days: 60,
+                taste_regions: 2,
+                unowned_share: 0.0,
+                respell_share: 0.0,
+                ..Default::default()
+            },
+        )?;
+        let plays = library_plays(&rows);
+        let past = history_sessions(&plays, 30 * 60);
+        let now = plays.last().map_or(0, |p| p.ts);
+        let profile = Profile::build(
+            space,
+            &past,
+            &cfg.steer.artist_of,
+            now,
+            &ProfileConfig::default(),
+        );
+        let model = SkipModel::train(space, &profile, &past);
+        let known = Known {
+            cfg: SessionConfig {
+                taste: profile.centroids(),
+                ..cfg.steer.clone()
+            },
+            retainer: model.as_ref().map(|m| Retainer::new(m, space, &profile)),
+        };
         let favs: Vec<TrackId> = taste
             .favourites(0.05)
             .into_iter()
@@ -237,7 +310,7 @@ pub fn simulated_listeners(
             let run_seed = lseed.wrapping_mul(31).wrapping_add(s as u64 + 1);
             for (p, acc) in pickers.iter().zip(&mut accs) {
                 run_session(
-                    space, &taste, *p, seed_track, cfg.length, &cfg.steer, run_seed, acc,
+                    space, &taste, *p, seed_track, cfg.length, &cfg.steer, &known, run_seed, acc,
                 );
             }
         }

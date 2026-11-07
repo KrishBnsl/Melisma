@@ -20,6 +20,7 @@ dhunn-dsp.workspace = true
 dhunn-eval.workspace = true
 dhunn-import.workspace = true
 dhunn-index.workspace = true
+dhunn-profile.workspace = true
 dhunn-steer.workspace = true
 dhunn-store.workspace = true
 dirs.workspace = true

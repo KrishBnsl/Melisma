@@ -1,0 +1,13 @@
+[package]
+name = "dhunn-profile"
+description = "Per-user taste profiles and the learned skip model"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+dhunn-core.workspace = true
+dhunn-index.workspace = true
+dhunn-steer.workspace = true
+dhunn-store.workspace = true
+serde.workspace = true

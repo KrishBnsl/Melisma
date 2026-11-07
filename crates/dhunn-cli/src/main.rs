@@ -4,6 +4,7 @@ mod eval;
 mod history;
 mod library;
 mod listen;
+mod profile;
 
 use std::{
     path::{Path, PathBuf},
@@ -128,6 +129,11 @@ enum Command {
         #[arg(long, hide = true)]
         smoke: Option<u64>,
     },
+    /// Show what dhunn has learned about you: taste regions and the skip model.
+    Profile {
+        #[arg(long, short)]
+        user: Option<String>,
+    },
     /// Measure recommendation quality: next-track prediction on your history, simulated
     /// listeners, and your logged sessions. Each run is saved and compared with the last.
     Eval {
@@ -195,6 +201,7 @@ fn main() -> Result<()> {
         } => history::import(&library::db_path(db)?, service, &path, &user),
         Command::History { user, top } => history::history(&library::db_path(db)?, &user, top),
         Command::Dev { action } => history::dev(&library::db_path(db)?, action),
+        Command::Profile { user } => profile::profile(&library::db_path(db)?, user.as_deref()),
         Command::Eval {
             user,
             holdout_days,

@@ -18,6 +18,7 @@ dhunn-import = { path = "crates/dhunn-import" }
 dhunn-eval = { path = "crates/dhunn-eval" }
 dhunn-index = { path = "crates/dhunn-index" }
 dhunn-steer = { path = "crates/dhunn-steer" }
+dhunn-profile = { path = "crates/dhunn-profile" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }

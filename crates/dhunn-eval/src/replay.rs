@@ -7,14 +7,17 @@
 //! listened to next landed. Skipped next tracks are not targets (the user didn't want them),
 //! but they still play into the session, as they did in reality.
 //!
+//! The recommender's profile and skip model are built from the train period only.
+//!
 //! Caveat: on simulated history the "previous track" model has an edge by construction (the
 //! simulator picks by similarity to the previous track). On real history it's a fair race.
 
 use std::collections::{HashMap, HashSet};
 
 use dhunn_core::{TrackId, UserId};
-use dhunn_index::{SoundSpace, dot};
-use dhunn_steer::{Feedback, Session, SessionConfig};
+use dhunn_index::SoundSpace;
+use dhunn_profile::{Profile, ProfileConfig, Retainer, SkipModel, auc, history_sessions};
+use dhunn_steer::{Feedback, Retention, Session, SessionConfig};
 use dhunn_store::{MatchedPlay, Store, StoreError};
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +54,9 @@ pub struct ReplayReport {
     pub rows: Vec<RankRow>,
     /// How well a model's score separates listened from skipped test plays (0.5 = chance).
     pub skip_auc: Vec<(String, f64)>,
+    /// The skip model trained on the train period (`None`: too little data).
+    #[serde(default)]
+    pub skip_model: Option<SkipModel>,
 }
 
 #[derive(Default)]
@@ -109,30 +115,6 @@ fn rank_by(
     1.0 + above as f64 + ties as f64 / 2.0
 }
 
-/// Area under the ROC curve: probability a random positive outscores a random negative.
-pub fn auc(scored: &[(f32, bool)]) -> Option<f64> {
-    let mut v = scored.to_vec();
-    v.sort_by(|a, b| a.0.total_cmp(&b.0));
-    let pos = v.iter().filter(|x| x.1).count();
-    let neg = v.len() - pos;
-    if pos == 0 || neg == 0 {
-        return None;
-    }
-    // Rank sum of positives, with average ranks for ties.
-    let mut rank_sum = 0.0;
-    let mut i = 0;
-    while i < v.len() {
-        let mut j = i;
-        while j < v.len() && v[j].0 == v[i].0 {
-            j += 1;
-        }
-        let avg = (i + j + 1) as f64 / 2.0; // ranks i+1..=j
-        rank_sum += avg * v[i..j].iter().filter(|x| x.1).count() as f64;
-        i = j;
-    }
-    Some((rank_sum - (pos * (pos + 1)) as f64 / 2.0) / (pos * neg) as f64)
-}
-
 fn sessions(plays: &[MatchedPlay], gap_s: i64) -> Vec<Vec<MatchedPlay>> {
     let mut out: Vec<Vec<MatchedPlay>> = Vec::new();
     for p in plays {
@@ -172,8 +154,24 @@ pub fn replay(
         *listens.entry(p.track).or_default() += 1.0;
     }
     let train_listens = listens.values().sum::<f32>() as usize;
-    let taste_pts: Vec<(TrackId, f32)> = listens.iter().map(|(&t, &w)| (t, w)).collect();
-    let taste = space.centroid(&taste_pts);
+
+    // What the recommender knows: a profile and skip model from the train period only.
+    let train_sessions = history_sessions(&train, cfg.session_gap_s);
+    let profile = Profile::build(
+        space,
+        &train_sessions,
+        &cfg.steer.artist_of,
+        cutoff,
+        &ProfileConfig::default(),
+    );
+    let model = SkipModel::train(space, &profile, &train_sessions);
+    // Predicting what happens uses everything the model knows; steering uses the version
+    // that gives familiar tracks no bonus.
+    let retainer = model.as_ref().map(|m| Retainer {
+        familiarity_bonus: true,
+        ..Retainer::new(m, space, &profile)
+    });
+    let steer_retainer = model.as_ref().map(|m| Retainer::new(m, space, &profile));
 
     let mut durations: HashMap<TrackId, f64> = HashMap::new();
     for p in &test {
@@ -185,23 +183,46 @@ pub fn replay(
 
     let ids = space.ids();
     let sim = |a: TrackId, b: TrackId| space.similarity(a, b);
-    let taste_score = |t: TrackId| match (&taste, space.vector(t)) {
-        (Some(c), Some(v)) => dot(c, v),
-        _ => 0.0,
+    let taste_score = |t: TrackId| {
+        space
+            .vector(t)
+            .and_then(|v| profile.taste_of(v))
+            .unwrap_or(0.0)
     };
 
-    let mut acc: [Acc; 5] = Default::default();
-    let names = ["random", "popular", "your taste", "previous track", "steer"];
+    let names = [
+        "random",
+        "popular",
+        "your taste",
+        "previous track",
+        "skip model",
+        "steer, no profile",
+        "steer",
+    ];
+    let mut acc: Vec<Acc> = names.iter().map(|_| Acc::default()).collect();
     let sess = sessions(&test, cfg.session_gap_s);
     let mut skip_taste = Vec::new();
     let mut skip_prev = Vec::new();
+    let mut skip_model = Vec::new();
+    let plain = SessionConfig {
+        seed: 1,
+        ..cfg.steer.clone()
+    };
+    let full = SessionConfig {
+        taste: profile.centroids(),
+        ..plain.clone()
+    };
     for s in &sess {
         let mut played: HashSet<TrackId> = HashSet::new();
-        let mut steer: Option<Session> = None;
+        let mut history: Vec<(TrackId, bool)> = Vec::new();
+        let mut steers: Vec<Session> = Vec::new();
         for (i, p) in s.iter().enumerate() {
             skip_taste.push((taste_score(p.track), p.listened));
             if i > 0 {
                 skip_prev.push((sim(s[i - 1].track, p.track), p.listened));
+            }
+            if let Some(r) = &retainer {
+                skip_model.push((r.listen_probability(&history, p.track), p.listened));
             }
             if i > 0 && p.listened && !played.contains(&p.track) {
                 let avail = ids.len() - played.len();
@@ -217,36 +238,41 @@ pub fn replay(
                 acc[2].add(Some(rank_by(ids, &played, p.track, taste_score)));
                 let prev = s[i - 1].track;
                 acc[3].add(Some(rank_by(ids, &played, p.track, |t| sim(prev, t))));
-                let rank = steer.as_ref().and_then(|st| {
-                    st.ranked(MAX_RANK)
+                acc[4].add(retainer.as_ref().map(|r| {
+                    rank_by(ids, &played, p.track, |t| r.listen_probability(&history, t))
+                }));
+                for (k, st) in steers.iter().enumerate() {
+                    let rank = st
+                        .ranked(MAX_RANK)
                         .iter()
                         .position(|(t, _)| *t == p.track)
-                        .map(|r| r as f64 + 1.0)
-                });
-                acc[4].add(rank);
+                        .map(|r| r as f64 + 1.0);
+                    acc[5 + k].add(rank);
+                }
             }
             played.insert(p.track);
-            match &mut steer {
-                None => {
-                    let c = SessionConfig {
-                        seed: 1,
-                        ..cfg.steer.clone()
-                    };
-                    steer = Session::new(space, &[p.track], c);
-                }
-                Some(st) => {
-                    st.observe(p.track);
-                    let fb = if p.listened {
-                        Feedback::Finished
+            history.push((p.track, p.listened));
+            if steers.is_empty() {
+                steers.extend(Session::new(space, &[p.track], plain.clone()));
+                let with = Session::new(space, &[p.track], full.clone());
+                steers.extend(match &steer_retainer {
+                    Some(r) => with.map(|w| w.with_retention(r)),
+                    None => with,
+                });
+            } else {
+                let fb = if p.listened {
+                    Feedback::Finished
+                } else {
+                    let dur = durations.get(&p.track).copied().unwrap_or(0.0);
+                    let at = if dur > 0.0 {
+                        (p.ms_played as f64 / 1000.0 / dur) as f32
                     } else {
-                        let dur = durations.get(&p.track).copied().unwrap_or(0.0);
-                        let at = if dur > 0.0 {
-                            (p.ms_played as f64 / 1000.0 / dur) as f32
-                        } else {
-                            0.1
-                        };
-                        Feedback::Skipped { at }
+                        0.1
                     };
+                    Feedback::Skipped { at }
+                };
+                for st in &mut steers {
+                    st.observe(p.track);
                     st.feedback(p.track, fb);
                 }
             }
@@ -258,11 +284,14 @@ pub fn replay(
         return Ok(None);
     }
     let mut skip_auc = Vec::new();
-    if let Some(a) = auc(&skip_taste) {
-        skip_auc.push(("your taste".to_owned(), a));
-    }
-    if let Some(a) = auc(&skip_prev) {
-        skip_auc.push(("previous track".to_owned(), a));
+    for (name, v) in [
+        ("your taste", &skip_taste),
+        ("previous track", &skip_prev),
+        ("skip model", &skip_model),
+    ] {
+        if let Some(a) = auc(v) {
+            skip_auc.push((name.to_owned(), a));
+        }
     }
     Ok(Some(ReplayReport {
         holdout_days: cfg.holdout_days,
@@ -272,22 +301,13 @@ pub fn replay(
         steps,
         rows: names.iter().zip(&acc).map(|(n, a)| a.row(n)).collect(),
         skip_auc,
+        skip_model: model,
     }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn auc_basics() {
-        assert_eq!(auc(&[(1.0, true), (0.0, false)]), Some(1.0));
-        assert_eq!(auc(&[(0.0, true), (1.0, false)]), Some(0.0));
-        assert_eq!(auc(&[(0.5, true), (0.5, false)]), Some(0.5));
-        assert_eq!(auc(&[(0.5, true)]), None);
-        let a = auc(&[(0.1, false), (0.4, true), (0.35, false), (0.8, true)]).unwrap();
-        assert!((a - 1.0).abs() < 1e-12, "{a}");
-    }
 
     #[test]
     fn ranks_with_ties_and_exclusions() {

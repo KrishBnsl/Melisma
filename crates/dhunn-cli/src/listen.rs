@@ -15,6 +15,9 @@ use crossterm::{
 };
 use dhunn_core::TrackId;
 use dhunn_index::{AspectWeights, SoundSpace};
+use dhunn_profile::{
+    Profile, ProfileConfig, Retainer, SkipModel, history_sessions, logged_sessions,
+};
 use dhunn_steer::{Feedback, Pick, Reason, Session, SessionConfig};
 use dhunn_store::{EventKind, SessionId, Store, User};
 
@@ -91,7 +94,7 @@ fn resolve_seeds(
     Ok(vec![ids[(now_ms() as usize / 1000) % ids.len()]])
 }
 
-fn name(store: &Store, t: TrackId) -> String {
+pub(crate) fn name(store: &Store, t: TrackId) -> String {
     match store.track(t).ok().flatten() {
         Some(r) => match r.artists.first() {
             Some(a) => format!("{a} – {}", r.title),
@@ -139,24 +142,84 @@ fn reason_text(store: &Store, r: &Reason) -> String {
     format!("{what} to {}", name(store, r.like))
 }
 
+/// What dhunn knows about a listener, rebuilt from their history and logged sessions.
+pub(crate) struct Known {
+    pub profile: Profile,
+    pub model: Option<SkipModel>,
+}
+
+/// Builds the user's profile and skip model (`None` without a user or any plays).
+pub(crate) fn know(
+    store: &Store,
+    space: &SoundSpace,
+    user: Option<&User>,
+) -> Result<Option<Known>> {
+    let Some(u) = user else { return Ok(None) };
+    let mut sessions = history_sessions(&store.matched_plays(u.id)?, 30 * 60);
+    sessions.extend(logged_sessions(&store.logged_sessions(u.id)?));
+    if sessions.is_empty() {
+        return Ok(None);
+    }
+    let profile = Profile::build(
+        space,
+        &sessions,
+        &store.primary_artists()?,
+        now_ms() / 1000,
+        &ProfileConfig::default(),
+    );
+    let model = SkipModel::train(space, &profile, &sessions);
+    Ok(Some(Known { profile, model }))
+}
+
 fn session_config(
     store: &Store,
     user: Option<&User>,
+    known: Option<&Known>,
     adventure: Option<f32>,
     rng_seed: u64,
 ) -> Result<SessionConfig> {
-    let exclude = match user {
+    let mut exclude = match user {
         Some(u) => store.recently_played(u.id, now_ms() - RECENT_WINDOW_MS)?,
         None => HashSet::new(),
     };
+    if let Some(k) = known {
+        exclude.extend(&k.profile.disliked);
+    }
     Ok(SessionConfig {
         adventurousness: adventure.or(user.map(|u| u.adventurousness)).unwrap_or(0.5),
         seed: rng_seed,
         exclude,
         artist_of: store.primary_artists()?,
         song_of: song_keys(store)?,
+        taste: known.map(|k| k.profile.centroids()).unwrap_or_default(),
         ..Default::default()
     })
+}
+
+fn retainer<'a>(space: &'a SoundSpace, known: Option<&'a Known>) -> Option<Retainer<'a>> {
+    let k = known?;
+    Some(Retainer::new(k.model.as_ref()?, space, &k.profile))
+}
+
+/// A session, with the skip model attached when there is one.
+fn start<'a>(
+    space: &'a SoundSpace,
+    seeds: &[TrackId],
+    cfg: SessionConfig,
+    retainer: Option<&'a Retainer<'a>>,
+) -> Result<Session<'a>> {
+    let s = Session::new(space, seeds, cfg).context("seeds are not in the sound space")?;
+    Ok(match retainer {
+        Some(r) => s.with_retention(r),
+        None => s,
+    })
+}
+
+/// "· 82% likely you keep listening", when the skip model is attached.
+fn keep_text(p: &Pick) -> String {
+    p.keep
+        .map(|k| format!(" · {:.0}% likely you keep listening", k * 100.0))
+        .unwrap_or_default()
 }
 
 /// One key per song (normalized primary artist + title), so different files or versions
@@ -213,9 +276,10 @@ pub fn session(
     let (store, space) = load(db)?;
     let user = resolve_user(&store, user)?;
     let seed_ids = resolve_seeds(&store, &space, seeds, user.as_ref())?;
-    let cfg = session_config(&store, user.as_ref(), adventure, rng_seed)?;
-    let mut sess =
-        Session::new(&space, &seed_ids, cfg).context("seeds are not in the sound space")?;
+    let known = know(&store, &space, user.as_ref())?;
+    let cfg = session_config(&store, user.as_ref(), known.as_ref(), adventure, rng_seed)?;
+    let retainer = retainer(&space, known.as_ref());
+    let mut sess = start(&space, &seed_ids, cfg, retainer.as_ref())?;
     println!(
         "Seeds: {}",
         seed_ids
@@ -243,7 +307,7 @@ fn print_pick(store: &Store, i: usize, p: &Pick) {
         facts(store, p.track)
     );
     if let Some(r) = &p.reason {
-        println!("     {}", reason_text(store, r));
+        println!("     {}{}", reason_text(store, r), keep_text(p));
     }
 }
 
@@ -317,9 +381,16 @@ pub fn play(db: &Path, opts: PlayOptions<'_>) -> Result<()> {
     let (mut store, space) = load(db)?;
     let user = resolve_user(&store, opts.user)?;
     let seed_ids = resolve_seeds(&store, &space, opts.seeds, user.as_ref())?;
-    let cfg = session_config(&store, user.as_ref(), opts.adventure, now_ms() as u64)?;
-    let mut sess =
-        Session::new(&space, &seed_ids, cfg).context("seeds are not in the sound space")?;
+    let known = know(&store, &space, user.as_ref())?;
+    let cfg = session_config(
+        &store,
+        user.as_ref(),
+        known.as_ref(),
+        opts.adventure,
+        now_ms() as u64,
+    )?;
+    let retainer = retainer(&space, known.as_ref());
+    let mut sess = start(&space, &seed_ids, cfg, retainer.as_ref())?;
 
     let mut device = rodio::DeviceSinkBuilder::open_default_sink()
         .context("opening the default audio output")?;
@@ -395,7 +466,11 @@ pub fn play(db: &Path, opts: PlayOptions<'_>) -> Result<()> {
         p.log(Some(t), EventKind::Play, Some(Duration::ZERO));
         line(&format!("▶ {}  [{}]", name(p.store, t), facts(p.store, t)));
         if let Some(r) = &pick.reason {
-            line(&format!("  {}", reason_text(p.store, r)));
+            line(&format!(
+                "  {}{}",
+                reason_text(p.store, r),
+                keep_text(&pick)
+            ));
         }
 
         let after = match opts.smoke {

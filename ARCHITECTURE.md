@@ -38,6 +38,7 @@ dhunn/
 │   ├── dhunn-import/          # Spotify (extended + basic) / Apple parsers, history → library matching ✅
 │   ├── dhunn-index/           # sound space: aspect-weighted vectors, exact kNN, aspect closeness ✅; later HNSW + graph
 │   ├── dhunn-profile/         # long-term taste + session state
+│   ├── dhunn-profile/         # per-user taste regions, dislikes, learned skip model ✅
 │   ├── dhunn-steer/           # sessions: next pick + feedback (basic drift model ✅); later modes, trajectory planning
 │   ├── dhunn-score/           # candidate scoring + blending weights
 │   ├── dhunn-explain/         # human-readable reasons
@@ -168,6 +169,15 @@ Decoding/analysis runs on a bounded worker pool (default: half the cores, max 6)
 
 ## 6. Profile (`dhunn-profile`)
 
+**Implemented (step 6a).** Rebuilt from the user's imported history plus `dhunn play` sessions every time it's needed (milliseconds at this scale; nothing stored, always current):
+- **Track weights:** each play adds `decay × signal`, decay = half-life 90 days, signal = +1 listened / −0.3 skipped (< 30 s) / +2 like / −3 dislike.
+- **Taste regions:** weighted spherical k-means over positively weighted tracks, k = √(n/4) clamped to 1–6, deterministic start. `taste_of(v)` = closeness to the nearest region (best at finding what you'll play next); `overall_of(v)` = closeness to the share-weighted centre (best at telling listens from skips).
+- **Dislikes** with no later like → excluded from every session.
+- **Skip model:** logistic regression on 9 features — previous-track similarity, taste, overall taste, track and artist listen rate (smoothed log-odds, leave-one-out while training), track plays, share of recent skips, similarity to a recent skip, position in session. Trains in milliseconds; needs ≥ 30 plays with both listens and skips. Steering uses it *without familiarity or taste*: track/artist rates are capped at your average (it still avoids what you tend to skip, but never favours a track for being familiar) and the taste features are neutralized (taste is steering's own term). A GRU replaces it only when there are thousands of logged sessions and eval shows it wins.
+- `dhunn profile` shows regions (with their top tracks), dislikes and the model's weights.
+
+Originally planned:
+
 - **Per user.** Every profile and session is keyed by `user_id`.
 - **Long-term taste:** weighted set of sound-space centroids (mixture, k≈3–8) learned from positive events and imported history with time decay; plus a "frontier" (regions touched but not settled); plus artist affinities (covers unowned artists from imported history).
 - **Adventurousness** a ∈ [0, 1] per user → default σ and `w_novel` (e.g. σ = σ_min + a·(σ_max − σ_min)).
@@ -185,7 +195,15 @@ score = (1 − e)·sim(anchor) + 1.0·sim(previous track) − e·sim(recently he
 
 then samples among the best 3–8. Continuity with the previous track plus repulsion from what was heard makes sessions move *forward* along a path instead of circling or hopping across the anchor. Feedback: **finish** pulls the anchor 20% toward the track; **like** 40%; an **early skip** adds an avoid point (weight falls with how late the skip was) and eases exploration down; **dislike** bans the track and adds a strong avoid point; **further** raises `e` by 0.2 and extrapolates the anchor past the current track in the direction of travel; **back** lowers `e` and restores the previous anchor. Never in a session: seeds, a second version of the same song (same normalized artist + title — WAV/MP3 copies, remasters), more than 2 tracks in a row by one artist; across sessions, tracks played in the last 36 h are skipped while alternatives exist.
 
-**Planned (step 6):**
+**Implemented (step 6a) — profile in the score:**
+
+```
+score += taste_weight · (1 − e)² · taste_of(track)   + retention_weight · (1 − e) · (P(listen) − 0.5)
+```
+
+with `taste_weight` 0.5 and `retention_weight` 1.0. The profile's pull fades fast as exploration rises, so adventurousness (and "further") still lets a session leave home. Without the fade, or with taste also counted inside the skip model, every adventurousness level gave the same sessions (variety −17 points at a=0.8).
+
+**Planned (step 6b):**
 
 Each mode produces a **target** and a **step budget**:
 
@@ -269,6 +287,28 @@ What it says:
 - **Steering ignores long-term taste**: on history, "popular" and "your taste" beat it at hit@50 because the session only knows its seeds and what it played. Mixing the profile in is step 6.
 - Caveats: the history is simulated (its listener picks by previous-track similarity and replays favourites, which flatters those two models); the simulated listeners' taste comes from the same DSP features the recommender uses. Real history and logged sessions are the arbiters. Same-artist pairs can't be measured on FMP (9 of 479 tracks have artist tags).
 
+**After step 6a (profile + skip model, run "profile + skip model"):**
+
+| next track | hit@10 | hit@50 | MRR |
+|---|---|---|---|
+| your taste (regions) | 57.5% | 79.6% | 0.236 |
+| skip model | 55.8% | 76.1% | 0.250 |
+| steer, no profile | 42.5% | 52.2% | 0.187 |
+| steer | 43.4% | 53.1% | 0.193 |
+
+Skip AUC: skip model 0.81, taste regions 0.76, previous track 0.74 (the single centroid of step 5 scored 0.84 — hence the "overall taste" feature).
+
+| simulated sessions (listeners now have 60 days of past history) | taste | skipped | liked | travel | variety |
+|---|---|---|---|---|---|
+| steer a=0.2 | 85.5 | 10.8% | 14.6% | 0.63 | 54.2% |
+| steer a=0.5 | 85.0 | 11.5% | 14.3% | 0.68 | 56.9% |
+| steer a=0.8 | 81.9 | 14.5% | 13.0% | 0.78 | 61.4% |
+| steer a=0.5, no profile | 82.3 | 14.6% | 12.4% | 0.68 | 60.4% |
+
+- Knowing you helps: +3 taste points, 3 points fewer skips, more likes; adventurousness is now a working dial (travel 0.63 → 0.78, variety 54% → 61%).
+- It costs ~3–4 points of variety at the same adventurousness — the price of pulling toward home.
+- On history, steering gains little (+0.9 hit@10): the replay rewards replaying favourites, which steering deliberately doesn't do. "Your taste" and the skip model alone predict far better — they'd make a good "your usual" mode, not a discovery engine.
+
 Planned: listening tests (export pairs of sessions from variants A and B as blind playlists; record preferences); steering-reach metrics once destinations exist.
 
 ## 12. CLI (`dhunn-cli`, clap)
@@ -284,6 +324,7 @@ dhunn dev sample-history --out <dir> [--days N --seed S --regions K]  # ✅ simu
 dhunn similar <song words> [-n 10]    # ✅ nearest tracks + which aspects they share
 dhunn session [--seed <song words>]... [--user] [--len N] [--adventure A] [--rng S]  # ✅ print a planned session
 dhunn play [--seed <song words>]... [--user] [--adventure A]  # ✅ listen: space pause · n next · l like · d dislike · f further · b back · ± volume · q quit
+dhunn profile [--user]               # ✅ taste regions, dislikes, skip-model weights
 dhunn eval [--user] [--holdout-days 14] [--listeners 16 --sessions 6 --len 25] [--param name=value]... [--label L] [--no-save] [--json]  # ✅ compared with the last run
 dhunn index                           # (not needed yet: the space is built at startup) clusters, artist graph
 dhunn mb-sync                         # optional MusicBrainz/ListenBrainz matching (rate-limited)
@@ -308,7 +349,7 @@ symphonia, rubato, realfft, ndarray, rayon, ort (ONNX Runtime), rusqlite, lofty,
 3. ✅ `import` (Spotify extended + basic, Apple best-effort) + track matching + simulated-listener sample data.
 4. ✅ `index` (exact, aspect-weighted) + basic steering session + **`dhunn play`** (rodio playback, keyboard controls, event logging) — pulled forward so the app can be used daily and real feedback accumulates.
 5. ✅ `eval`: next-track replay on history, simulated listeners with feedback, logged-session summary; runs saved and compared — baseline numbers in §11.
-6. `profile` (per user, adventurousness) + `steer` (drift, destination) + `explain`.
+6. ✅ (6a) `profile`: taste regions, dislikes, learned skip model, both mixed into steering; `dhunn profile`. (6b, next) steering modes — surprise me, something new, destination with path planning — and `explain`.
 7. `embed` (CLAP + audio model) → vibe text, surprise/new modes; re-run eval.
 8. Friend modes (`friend`, `bridge`, `friend_signal`) once two or more users have imported history.
 9. `meta` (MusicBrainz + ListenBrainz graph), `discover`, interactive mode + event logging. HNSW only if exact search gets slow.

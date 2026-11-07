@@ -104,6 +104,7 @@ fn eval_runs_on_simulated_history() {
         "{rep:?}"
     );
     assert!(row("steer").hit10 > 3.0 * row("random").hit10, "{rep:?}");
+    assert!(rep.skip_model.is_some());
     // Liked sound is listened to, disliked sound skipped.
     assert!(rep.skip_auc.iter().all(|(_, a)| *a > 0.55), "{rep:?}");
 
@@ -120,7 +121,12 @@ fn eval_runs_on_simulated_history() {
     )
     .unwrap();
     let r = |n: &str| lis.rows.iter().find(|r| r.name == n).unwrap();
-    assert_eq!(lis.rows.len(), 5);
+    assert_eq!(lis.rows.len(), 6);
+    // Knowing the listener's past (profile + skip model) helps.
+    assert!(
+        r("steer a=0.5").taste > r("steer a=0.5, no profile").taste,
+        "{lis:?}"
+    );
     // Steering finds the listener's taste and keeps transitions smooth; random does neither.
     assert!(r("steer a=0.5").taste > r("random").taste + 15.0, "{lis:?}");
     assert!(r("steer a=0.5").skip < r("random").skip, "{lis:?}");

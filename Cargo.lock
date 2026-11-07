@@ -431,6 +431,7 @@ dependencies = [
  "dhunn-eval",
  "dhunn-import",
  "dhunn-index",
+ "dhunn-profile",
  "dhunn-steer",
  "dhunn-store",
  "dirs",
@@ -465,6 +466,7 @@ dependencies = [
  "dhunn-dsp",
  "dhunn-import",
  "dhunn-index",
+ "dhunn-profile",
  "dhunn-steer",
  "dhunn-store",
  "serde",
@@ -504,6 +506,17 @@ version = "0.1.0"
 dependencies = [
  "dhunn-core",
  "lofty",
+]
+
+[[package]]
+name = "dhunn-profile"
+version = "0.1.0"
+dependencies = [
+ "dhunn-core",
+ "dhunn-index",
+ "dhunn-steer",
+ "dhunn-store",
+ "serde",
 ]
 
 [[package]]

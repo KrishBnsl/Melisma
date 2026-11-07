@@ -28,6 +28,8 @@ pub fn params_list(p: &SteerParams) -> Vec<(String, f32)> {
         ("avoid_penalty".into(), p.avoid_penalty),
         ("finish_pull".into(), p.finish_pull),
         ("like_pull".into(), p.like_pull),
+        ("taste_weight".into(), p.taste_weight),
+        ("retention_weight".into(), p.retention_weight),
     ]
 }
 
@@ -157,10 +159,27 @@ pub fn render(r: &Report, prev: Option<&Report>) -> String {
                             .map(|x| x.1);
                         format!("{n} {}", cell(*a, p, Fmt::Dec(2)))
                     })
-                    .collect();
-                out.push_str(&format!(
+                    .collect();                out.push_str(&format!(
                     "\nTelling listens from skips (AUC, 0.5 = chance): {}\n",
                     auc.join(" · ")
+                ));
+            }
+            if let Some(m) = &rep.skip_model {
+                let mut w: Vec<(&str, f32)> = dhunn_profile::FEATURES
+                    .iter()
+                    .copied()
+                    .zip(m.weights)
+                    .collect();
+                w.sort_by(|a, b| b.1.abs().total_cmp(&a.1.abs()));
+                let top: Vec<String> = w
+                    .iter()
+                    .take(3)
+                    .map(|(f, x)| format!("{f} {x:+.2}"))
+                    .collect();
+                out.push_str(&format!(
+                    "Skip model: trained on {} plays before the hold-out; strongest signals: {}\n",
+                    m.samples,
+                    top.join(", ")
                 ));
             }
         }
@@ -248,6 +267,7 @@ mod tests {
                     mrr: 0.1,
                 }],
                 skip_auc: vec![("your taste".into(), 0.7)],
+                skip_model: None,
             }),
             listeners: None,
             logged: None,
