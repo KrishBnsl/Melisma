@@ -36,7 +36,7 @@ dhunn/
 │   ├── dhunn-store/           # SQLite (rusqlite) for metadata, features, events
 │   ├── dhunn-meta/            # tag reading + artist-credit parsing (lofty) ✅; later MusicBrainz matching + artist graph, ListenBrainz similar-artists / discovery items
 │   ├── dhunn-import/          # Spotify (extended + basic) / Apple parsers, history → library matching ✅
-│   ├── dhunn-index/           # sound space: aspect-weighted vectors, exact kNN, aspect closeness ✅; later HNSW + graph
+│   ├── dhunn-index/           # sound space: aspect-weighted vectors, exact kNN, aspect closeness, library map of places + routes ✅; later HNSW + artist graph
 │   ├── dhunn-profile/         # long-term taste + session state
 │   ├── dhunn-profile/         # per-user taste regions, dislikes, learned skip model ✅
 │   ├── dhunn-steer/           # sessions: next pick + feedback (basic drift model ✅); later modes, trajectory planning
@@ -203,23 +203,19 @@ score += taste_weight · (1 − e)² · taste_of(track)   + retention_weight · 
 
 with `taste_weight` 0.5 and `retention_weight` 1.0. The profile's pull fades fast as exploration rises, so adventurousness (and "further") still lets a session leave home. Without the fade, or with taste also counted inside the skip model, every adventurousness level gave the same sessions (variety −17 points at a=0.8).
 
-**Planned (step 6b):**
+**Implemented (step 6b) — modes.** A **library map** (`dhunn-index::places`) groups tracks into places (spherical k-means, ~1 per 8 tracks, 4–300, fitted on ≤ 20k sampled tracks) linked to their 6 nearest places. Modes that travel plan a **journey** of places on the first pick:
 
-Each mode produces a **target** and a **step budget**:
-
-| Mode | Target | Step budget |
+| Mode | Where it goes | How |
 |---|---|---|
-| Drift (default) | point slightly beyond current position along frontier/novelty direction | small, σ adaptive |
-| Surprise me | sampled distant-but-coherent region (high-quality cluster not yet visited) | one big hop, then small |
-| Something new | nearest region with unheard artists | medium |
-| Vibe | CLAP text vector / mood controls / seed centroid / context prior → mapped into sound space | medium until reached |
-| Destination | named region/artist/genre | path planned in advance |
-| Toward friend | nearest centroid of the friend's taste mixture not already in mine | path planned in advance, like Destination |
-| Bridge (group) | overlap region between two or more users' mixtures | small; stay near the overlap |
+| drift (default) | onward from the seeds | as above |
+| usual | stays with what you play most | exploration 0.05, double taste weight |
+| surprise (`--mode surprise`, or `s` while playing) | a coherent place far from here, mostly unplayed, that your taste still reaches (score = coherence + unplayed share − closeness to here + ½·taste) — one of the best 3 at random | one big hop (continuity ignored for that pick), then settles (exploration halved) |
+| something new | the nearest place where ≥ 50% of tracks are new to you | route of small steps; +0.3 score for unplayed tracks |
+| toward (`--to <song or artist>`) | a track, or the centre of an artist's tracks | route of small steps; settles on arrival |
 
-**Path planning (destination):** A* over a kNN graph of cluster centroids (and the artist graph as alternate edges) with edge cost = distance, constrained so each hop ≤ σ. Each waypoint yields a few tracks before advancing.
+**Routes:** Dijkstra over the place graph with hop cost (1 − similarity)², so many small steps beat one big jump. A journey leaves its starting place on the first pick and spends at most 2 picks per stop (paced to arrive within ~12). **Adaptation:** a skip on the way means "not this part of the way" — move on sooner (lingering at stops the listener skipped stalled journeys in eval: 79% arrived vs 89% after the change); "further" jumps to the next stop; "back" returns to the previous one. Explanations name the journey: "on the way to AC/DC · stop 3 of 5", "arrived near …", "surprise: a jump to a part of your library you haven't explored".
 
-**Adaptation:** skip early → shrink σ and pull back toward last liked point; "go further" → grow σ; "too far" → step back one waypoint, shrink σ.
+**Still planned:** vibe (text → CLAP, step 7), toward a friend and bridge (step 8), artist-graph edges in routes (step 9).
 
 ## 8. Scoring (`dhunn-score`)
 
@@ -309,6 +305,19 @@ Skip AUC: skip model 0.81, taste regions 0.76, previous track 0.74 (the single c
 - It costs ~3–4 points of variety at the same adventurousness — the price of pulling toward home.
 - On history, steering gains little (+0.9 hit@10): the replay rewards replaying favourites, which steering deliberately doesn't do. "Your taste" and the skip model alone predict far better — they'd make a good "your usual" mode, not a discovery engine.
 
+**After step 6b — modes** (adventurousness 0.5, with profile; destinations are tracks far from the start that the listener feels middling about; "reached" = a pick among the destination's 10 nearest tracks within 25 picks):
+
+| mode | taste | skipped | new to you | worst hop | reached |
+|---|---|---|---|---|---|
+| usual | 87.9 | 9.2% | 20% | 0.54 | – |
+| drift | 84.2 | 12.8% | 28% | 0.50 | – |
+| something new | 70.0 | 25.1% | 80% | 0.28 | – |
+| surprise | 65.8 | 29.8% | 83% | −0.19 (the hop) | – |
+| toward, planned route | 70.2 | 28.9% | 45% | 0.25 | 93% in 8.4 picks |
+| toward, straight jump | 69.8 | 29.7% | 44% | −0.27 | 100% in 2 picks |
+
+The planned route gets there in ~8 tracks without a jarring jump, at the same skip rate. Surprise first aimed *away* from the listener's taste (42% skipped); aiming for unexplored places their taste still reaches brought that to 30%.
+
 Planned: listening tests (export pairs of sessions from variants A and B as blind playlists; record preferences); steering-reach metrics once destinations exist.
 
 ## 12. CLI (`dhunn-cli`, clap)
@@ -322,8 +331,8 @@ dhunn import spotify|apple <path> --user <name>   # ✅ history export → histo
 dhunn history --user <name>          # ✅ match rates, top artists/tracks
 dhunn dev sample-history --out <dir> [--days N --seed S --regions K]  # ✅ simulated listener
 dhunn similar <song words> [-n 10]    # ✅ nearest tracks + which aspects they share
-dhunn session [--seed <song words>]... [--user] [--len N] [--adventure A] [--rng S]  # ✅ print a planned session
-dhunn play [--seed <song words>]... [--user] [--adventure A]  # ✅ listen: space pause · n next · l like · d dislike · f further · b back · ± volume · q quit
+dhunn session [--seed <song words>]... [--user] [--adventure A] [--mode drift|usual|surprise|new] [--to <song or artist>] [--len N] [--rng S]  # ✅ print a planned session
+dhunn play    (same steering options)  # ✅ listen: space pause · n next · l like · d dislike · f further · b back · s surprise me · ± volume · q quit
 dhunn profile [--user]               # ✅ taste regions, dislikes, skip-model weights
 dhunn eval [--user] [--holdout-days 14] [--listeners 16 --sessions 6 --len 25] [--param name=value]... [--label L] [--no-save] [--json]  # ✅ compared with the last run
 dhunn index                           # (not needed yet: the space is built at startup) clusters, artist graph
@@ -349,7 +358,7 @@ symphonia, rubato, realfft, ndarray, rayon, ort (ONNX Runtime), rusqlite, lofty,
 3. ✅ `import` (Spotify extended + basic, Apple best-effort) + track matching + simulated-listener sample data.
 4. ✅ `index` (exact, aspect-weighted) + basic steering session + **`dhunn play`** (rodio playback, keyboard controls, event logging) — pulled forward so the app can be used daily and real feedback accumulates.
 5. ✅ `eval`: next-track replay on history, simulated listeners with feedback, logged-session summary; runs saved and compared — baseline numbers in §11.
-6. ✅ (6a) `profile`: taste regions, dislikes, learned skip model, both mixed into steering; `dhunn profile`. (6b, next) steering modes — surprise me, something new, destination with path planning — and `explain`.
+6. ✅ (6a) `profile`: taste regions, dislikes, learned skip model, both mixed into steering; `dhunn profile`. ✅ (6b) modes: usual, surprise me, something new, toward a song/artist along a planned route; journey explanations; mode metrics in eval.
 7. `embed` (CLAP + audio model) → vibe text, surprise/new modes; re-run eval.
 8. Friend modes (`friend`, `bridge`, `friend_signal`) once two or more users have imported history.
 9. `meta` (MusicBrainz + ListenBrainz graph), `discover`, interactive mode + event logging. HNSW only if exact search gets slow.

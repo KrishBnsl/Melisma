@@ -101,30 +101,18 @@ enum Command {
     },
     /// Print a planned session without playing it.
     Session {
-        /// Start from these songs (search words; repeatable). Default: your most-played.
-        #[arg(long = "seed")]
-        seeds: Vec<String>,
-        #[arg(long, short)]
-        user: Option<String>,
+        #[command(flatten)]
+        steer: listen::SteerArgs,
         #[arg(long, default_value_t = 15)]
         len: usize,
-        /// Override the user's adventurousness (0..1) for this session.
-        #[arg(long)]
-        adventure: Option<f32>,
         /// Random seed, for reproducible sessions.
         #[arg(long, default_value_t = 1)]
         rng: u64,
     },
     /// Listen: plays a steered session with keyboard controls; every action is logged.
     Play {
-        /// Start from these songs (search words; repeatable). Default: your most-played.
-        #[arg(long = "seed")]
-        seeds: Vec<String>,
-        #[arg(long, short)]
-        user: Option<String>,
-        /// Override the user's adventurousness (0..1) for this session.
-        #[arg(long)]
-        adventure: Option<f32>,
+        #[command(flatten)]
+        steer: listen::SteerArgs,
         /// Non-interactive audio check: play N seconds of 3 tracks.
         #[arg(long, hide = true)]
         smoke: Option<u64>,
@@ -227,34 +215,10 @@ fn main() -> Result<()> {
             },
         ),
         Command::Similar { query, n } => listen::similar(&library::db_path(db)?, &query, n),
-        Command::Session {
-            seeds,
-            user,
-            len,
-            adventure,
-            rng,
-        } => listen::session(
-            &library::db_path(db)?,
-            &seeds,
-            user.as_deref(),
-            len,
-            adventure,
-            rng,
-        ),
-        Command::Play {
-            seeds,
-            user,
-            adventure,
-            smoke,
-        } => listen::play(
-            &library::db_path(db)?,
-            listen::PlayOptions {
-                seeds: &seeds,
-                user: user.as_deref(),
-                adventure,
-                smoke,
-            },
-        ),
+        Command::Session { steer, len, rng } => {
+            listen::session(&library::db_path(db)?, &steer, len, rng)
+        }
+        Command::Play { steer, smoke } => listen::play(&library::db_path(db)?, &steer, smoke),
         Command::Inspect {
             path,
             json,

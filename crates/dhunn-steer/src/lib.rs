@@ -17,7 +17,13 @@
 use std::collections::{HashMap, HashSet};
 
 use dhunn_core::TrackId;
+use dhunn_index::places::Places;
 use dhunn_index::{Aspect, SoundSpace, dot, normalize};
+
+pub mod journey;
+
+pub use journey::{Goal, Leg, Mode};
+use journey::{Journey, plan};
 
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
@@ -37,6 +43,12 @@ pub struct SessionConfig {
     /// The listener's long-term taste: unit-vector centroids in the sound space (empty =
     /// no profile). Picks close to any of them score higher, less so as exploration rises.
     pub taste: Vec<Vec<f32>>,
+    pub mode: Mode,
+    /// Tracks the listener has ever played (for "something new" and surprises).
+    pub known: HashSet<TrackId>,
+    /// Plan journeys as routes of small steps (false = head straight for the goal; for
+    /// evaluation).
+    pub plan_route: bool,
 }
 
 /// Predicts whether the listener will keep listening to a candidate (the learned skip
@@ -129,6 +141,9 @@ impl Default for SessionConfig {
             song_of: HashMap::new(),
             params: SteerParams::default(),
             taste: Vec::new(),
+            mode: Mode::Drift,
+            known: HashSet::new(),
+            plan_route: true,
         }
     }
 }
@@ -170,6 +185,8 @@ pub struct Pick {
     pub taste: Option<f32>,
     /// The skip model's P(listen), if a model is attached.
     pub keep: Option<f32>,
+    /// Where this pick is on a journey (surprise, something new, destination).
+    pub leg: Option<Leg>,
 }
 
 /// Deterministic xorshift for pick sampling.
@@ -185,6 +202,10 @@ impl Rng {
 }
 
 const AVOID_MEMORY: usize = 6;
+/// Bonus for tracks the listener has never played, in "something new" and surprises.
+const NOVELTY_BONUS: f32 = 0.3;
+/// Exploration in "your usual".
+const USUAL_EXPLORATION: f32 = 0.05;
 
 pub struct Session<'a> {
     space: &'a SoundSpace,
@@ -204,6 +225,10 @@ pub struct Session<'a> {
     /// Songs already heard in this session (seeds included), by `song_of` key or track id.
     heard_songs: HashSet<u64>,
     rng: Rng,
+    places: Option<&'a Places>,
+    journey: Option<Journey>,
+    /// Whether the mode's journey has been planned (on the first pick).
+    planned: bool,
 }
 
 fn song_key(cfg: &SessionConfig, t: TrackId) -> u64 {
@@ -222,7 +247,11 @@ impl<'a> Session<'a> {
     pub fn new(space: &'a SoundSpace, seeds: &[TrackId], cfg: SessionConfig) -> Option<Self> {
         let weighted: Vec<(TrackId, f32)> = seeds.iter().map(|&t| (t, 1.0)).collect();
         let anchor = space.centroid(&weighted)?;
-        let exploration = exploration_for(cfg.adventurousness);
+        let exploration = if cfg.mode == Mode::Usual {
+            USUAL_EXPLORATION
+        } else {
+            exploration_for(cfg.adventurousness)
+        };
         let seed = cfg.seed.max(1);
         let heard_songs = seeds.iter().map(|&t| song_key(&cfg, t)).collect();
         Some(Self {
@@ -248,8 +277,96 @@ impl<'a> Session<'a> {
             retention: None,
             heard_songs,
             rng: Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1),
+            places: None,
+            journey: None,
+            planned: false,
             cfg,
         })
+    }
+
+    /// Attaches the library map, which modes that travel (surprise, something new,
+    /// destination) need. Without it they behave like drift.
+    pub fn with_places(mut self, places: &'a Places) -> Self {
+        self.places = Some(places);
+        self
+    }
+
+    pub fn mode(&self) -> &Mode {
+        &self.cfg.mode
+    }
+
+    /// Switches mode mid-session (e.g. "surprise me" from the player); takes effect on the
+    /// next pick.
+    pub fn set_mode(&mut self, mode: Mode) {
+        self.cfg.mode = mode;
+        self.journey = None;
+        self.planned = false;
+    }
+
+    /// Where the session is on its journey, if it has one.
+    pub fn leg(&self) -> Option<Leg> {
+        self.journey.as_ref().map(|j| j.leg(j.hop_pending))
+    }
+
+    /// Points the anchor at the journey's current stop (the exact target once arrived).
+    fn aim(&mut self) {
+        let (Some(j), Some(pl)) = (&self.journey, self.places) else {
+            return;
+        };
+        self.anchor = match (&j.target, j.arrived()) {
+            (Some(t), true) => t.clone(),
+            _ => pl.places[j.stops[j.at]].centroid.clone(),
+        };
+    }
+
+    fn advance(&mut self) {
+        if let Some(j) = &mut self.journey
+            && !j.arrived()
+        {
+            j.at += 1;
+            j.picks_here = 0;
+            let arrived = j.arrived();
+            self.aim();
+            if arrived {
+                // Settle in at the destination instead of travelling on past it.
+                self.exploration *= 0.5;
+                self.base_exploration *= 0.5;
+            }
+        }
+    }
+
+    /// Plans the mode's journey on the first pick, and moves on to the next stop when it's
+    /// time.
+    fn travel(&mut self) {
+        if !self.planned {
+            self.planned = true;
+            if let Some(pl) = self.places {
+                let r = self.rng.f32();
+                self.journey = plan(
+                    &self.cfg.mode,
+                    pl,
+                    &self.anchor,
+                    &self.cfg.taste,
+                    &self.cfg.known,
+                    self.cfg.plan_route,
+                    r,
+                );
+                if let Some(j) = &mut self.journey {
+                    if j.hop_pending {
+                        j.at = j.stops.len() - 1;
+                    }
+                    self.anchor_stack.push(self.anchor.clone());
+                    self.aim();
+                }
+            }
+        }
+        if self
+            .journey
+            .as_ref()
+            .is_some_and(|j| !j.arrived() && j.picks_here >= j.per_stop)
+        {
+            self.advance();
+        }
     }
 
     /// Attaches a skip model: candidates the listener is likely to skip score lower.
@@ -302,6 +419,18 @@ impl<'a> Session<'a> {
         //         what makes the session drift toward new sound instead of circling)
         //       − closeness to recent skips.
         let p = &self.cfg.params;
+        // A surprise's big hop ignores continuity for one pick.
+        let hop = self.journey.as_ref().is_some_and(|j| j.hop_pending);
+        let smoothness = if hop { 0.0 } else { p.smoothness };
+        let novelty = match self.cfg.mode {
+            Mode::New | Mode::Surprise => NOVELTY_BONUS,
+            _ => 0.0,
+        };
+        let taste_weight = if self.cfg.mode == Mode::Usual {
+            2.0 * p.taste_weight
+        } else {
+            p.taste_weight
+        };
         let last = self
             .played
             .last()
@@ -339,9 +468,15 @@ impl<'a> Session<'a> {
                 // The pull of long-term taste fades fast as exploration rises: an adventurous
                 // listener (or one who pressed "further") isn't dragged back home.
                 let home = 1.0 - e;
-                let score = (1.0 - e) * sim + p.smoothness * smooth - e * familiar - penalty
-                    + p.taste_weight * home * home * taste
-                    + p.retention_weight * home * (keep - 0.5);
+                let new = if self.cfg.known.contains(&t) {
+                    0.0
+                } else {
+                    novelty
+                };
+                let score = (1.0 - e) * sim + smoothness * smooth - e * familiar - penalty
+                    + taste_weight * home * home * taste
+                    + p.retention_weight * home * (keep - 0.5)
+                    + new;
                 (rank, t, sim, score)
             })
             .collect();
@@ -373,6 +508,7 @@ impl<'a> Session<'a> {
 
     /// Chooses the next track, or `None` when everything has been played or excluded.
     pub fn next_pick(&mut self) -> Option<Pick> {
+        self.travel();
         let e = self.exploration.clamp(0.0, 1.0);
         let scored = self.scored(self.pool());
         if scored.is_empty() {
@@ -405,7 +541,21 @@ impl<'a> Session<'a> {
         self.history.push((track, true));
         let v = self.space.vector(track).expect("picked from the space");
         self.heard_songs.insert(song_key(&self.cfg, track));
+        let leg = self.journey.as_mut().map(|j| {
+            let leg = j.leg(j.hop_pending);
+            j.picks_here += 1;
+            leg
+        });
+        if let Some(j) = &mut self.journey
+            && j.hop_pending
+        {
+            // Landed: settle in before exploring again.
+            j.hop_pending = false;
+            self.exploration *= 0.5;
+            self.base_exploration *= 0.5;
+        }
         Some(Pick {
+            leg,
             track,
             similarity,
             rank,
@@ -514,6 +664,10 @@ impl<'a> Session<'a> {
                 // Past halfway, a skip is "enough of this", not "not this".
                 if at < 0.5 {
                     self.mark_skipped(track);
+                    // On a journey, a skip means "not this part of the way": move on sooner.
+                    if let Some(j) = &mut self.journey {
+                        j.picks_here += 1;
+                    }
                 }
                 // An early skip is a clear "not this"; a late skip barely says anything.
                 let weight = (1.0 - at.clamp(0.0, 1.0)).powi(2);
@@ -527,6 +681,18 @@ impl<'a> Session<'a> {
                 self.remember_avoid(track, 2.0);
                 self.banned.insert(track);
                 self.positives.retain(|&p| p != track);
+            }
+            Feedback::Further if self.journey.as_ref().is_some_and(|j| !j.arrived()) => {
+                self.exploration = (self.exploration + 0.1).min(1.0);
+                self.advance();
+            }
+            Feedback::Back if self.journey.as_ref().is_some_and(|j| j.at > 0) => {
+                self.exploration = (self.exploration - 0.1).max(0.0);
+                if let Some(j) = &mut self.journey {
+                    j.at -= 1;
+                    j.picks_here = 0;
+                }
+                self.aim();
             }
             Feedback::Further => {
                 self.anchor_stack.push(self.anchor.clone());
@@ -754,5 +920,178 @@ mod tests {
     #[test]
     fn unknown_seed_gives_no_session() {
         assert!(Session::new(&ring(), &[TrackId(999)], SessionConfig::default()).is_none());
+    }
+
+    fn run(s: &mut Session, n: usize) -> Vec<Pick> {
+        (0..n)
+            .filter_map(|_| {
+                let p = s.next_pick()?;
+                s.feedback(p.track, Feedback::Finished);
+                Some(p)
+            })
+            .collect()
+    }
+
+    fn worst_hop(start: TrackId, picks: &[Pick]) -> u64 {
+        let mut prev = start;
+        picks
+            .iter()
+            .map(|p| {
+                let d = dist(prev, p.track);
+                prev = p.track;
+                d
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn toward(target: TrackId, plan_route: bool) -> SessionConfig {
+        let s = ring();
+        SessionConfig {
+            adventurousness: 0.2,
+            mode: Mode::Toward {
+                target: s.vector(target).unwrap().to_vec(),
+                label: "the far side".into(),
+            },
+            plan_route,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn destination_is_reached_in_small_steps() {
+        let s = ring();
+        let places = Places::build(&s);
+        let mut sess = Session::new(&s, &[TrackId(1)], toward(TrackId(31), true))
+            .unwrap()
+            .with_places(&places);
+        let picks = run(&mut sess, 30);
+        assert!(
+            picks.iter().any(|p| dist(p.track, TrackId(31)) <= 2),
+            "never got there: {:?}",
+            picks.iter().map(|p| p.track.0).collect::<Vec<_>>()
+        );
+        let legs: Vec<&Leg> = picks.iter().filter_map(|p| p.leg.as_ref()).collect();
+        assert_eq!(legs.len(), picks.len());
+        assert!(legs.windows(2).all(|w| w[0].step <= w[1].step));
+        assert!(legs.first().unwrap().of >= 3, "{:?}", legs.first());
+        assert!(matches!(&legs[0].goal, Goal::Destination(l) if l == "the far side"));
+        // Places hold ~7 tracks each, so a step between neighbouring places is up to ~8.
+        assert!(worst_hop(TrackId(1), &picks) <= 8, "{picks:?}");
+        // Once there, it lingers near the destination before drifting on.
+        let arrived = picks
+            .iter()
+            .position(|p| dist(p.track, TrackId(31)) <= 2)
+            .unwrap();
+        assert!(
+            picks[arrived..arrived + 8]
+                .iter()
+                .all(|p| dist(p.track, TrackId(31)) <= 10),
+            "{:?}",
+            picks.iter().map(|p| p.track.0).collect::<Vec<_>>()
+        );
+
+        // Heading straight there jumps instead.
+        let mut direct = Session::new(&s, &[TrackId(1)], toward(TrackId(31), false))
+            .unwrap()
+            .with_places(&places);
+        let jumps = run(&mut direct, 30);
+        assert!(worst_hop(TrackId(1), &jumps) > worst_hop(TrackId(1), &picks));
+    }
+
+    #[test]
+    fn further_and_back_move_along_the_route() {
+        let s = ring();
+        let places = Places::build(&s);
+        let mut sess = Session::new(&s, &[TrackId(1)], toward(TrackId(31), true))
+            .unwrap()
+            .with_places(&places);
+        let p = sess.next_pick().unwrap();
+        // Stop 0 is where the session started; the first pick already heads for stop 1.
+        assert_eq!(p.leg.as_ref().unwrap().step, 1);
+        sess.feedback(p.track, Feedback::Further);
+        assert_eq!(sess.leg().unwrap().step, 2);
+        sess.feedback(p.track, Feedback::Further);
+        assert_eq!(sess.leg().unwrap().step, 3);
+        sess.feedback(p.track, Feedback::Back);
+        assert_eq!(sess.leg().unwrap().step, 2);
+    }
+
+    #[test]
+    fn surprise_hops_far_then_settles() {
+        let s = ring();
+        let places = Places::build(&s);
+        let cfg = SessionConfig {
+            mode: Mode::Surprise,
+            taste: vec![s.vector(TrackId(1)).unwrap().to_vec()],
+            ..Default::default()
+        };
+        let mut sess = Session::new(&s, &[TrackId(1)], cfg)
+            .unwrap()
+            .with_places(&places);
+        let picks = run(&mut sess, 8);
+        let first = &picks[0];
+        assert!(first.leg.as_ref().unwrap().hop);
+        assert!(dist(first.track, TrackId(1)) >= 12, "{first:?}");
+        assert!(!picks[1].leg.as_ref().unwrap().hop);
+        assert!(worst_hop(first.track, &picks[1..]) <= 6, "{picks:?}");
+    }
+
+    #[test]
+    fn something_new_goes_where_you_havent_been() {
+        let s = ring();
+        let places = Places::build(&s);
+        // The listener knows tracks 1–20 and 50–60.
+        let known: HashSet<TrackId> = (1..=20).chain(50..=60).map(TrackId).collect();
+        let cfg = SessionConfig {
+            mode: Mode::New,
+            known: known.clone(),
+            ..Default::default()
+        };
+        let mut sess = Session::new(&s, &[TrackId(10)], cfg)
+            .unwrap()
+            .with_places(&places);
+        let picks = run(&mut sess, 15);
+        let new = picks.iter().filter(|p| !known.contains(&p.track)).count();
+        assert!(
+            new >= 10,
+            "{:?}",
+            picks.iter().map(|p| p.track.0).collect::<Vec<_>>()
+        );
+        assert_eq!(picks[0].leg.as_ref().unwrap().goal, Goal::New);
+    }
+
+    #[test]
+    fn usual_stays_home() {
+        let s = ring();
+        let cfg = SessionConfig {
+            mode: Mode::Usual,
+            adventurousness: 1.0,
+            taste: vec![s.vector(TrackId(10)).unwrap().to_vec()],
+            ..Default::default()
+        };
+        let mut sess = Session::new(&s, &[TrackId(10)], cfg).unwrap();
+        assert!((sess.exploration() - USUAL_EXPLORATION).abs() < 1e-6);
+        let picks = run(&mut sess, 10);
+        assert!(
+            picks.iter().all(|p| dist(p.track, TrackId(10)) <= 10),
+            "{picks:?}"
+        );
+        assert!(picks.iter().all(|p| p.leg.is_none()));
+    }
+
+    #[test]
+    fn switching_to_surprise_mid_session() {
+        let s = ring();
+        let places = Places::build(&s);
+        let mut sess = Session::new(&s, &[TrackId(1)], SessionConfig::default())
+            .unwrap()
+            .with_places(&places);
+        let before = run(&mut sess, 3);
+        assert!(before.iter().all(|p| p.leg.is_none()));
+        sess.set_mode(Mode::Surprise);
+        let hop = sess.next_pick().unwrap();
+        assert!(hop.leg.unwrap().hop);
+        assert!(dist(hop.track, before[2].track) >= 10);
     }
 }

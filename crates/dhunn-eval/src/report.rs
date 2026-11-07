@@ -229,6 +229,44 @@ pub fn render(r: &Report, prev: Option<&Report>) -> String {
         out.push_str(
             "\n  taste = mean taste percentile of picks (50 = average track) · smooth / worst hop = sound\n  similarity between consecutive tracks · travel = 1 − similarity of the last pick to the start\n",
         );
+        if !l.modes.is_empty() {
+            out.push_str("\nModes (adventurousness 0.5, with the listener's profile)\n\n");
+            let opt = |v: Option<f64>, p: Option<Option<f64>>, f: Fmt| {
+                v.map_or("–".to_owned(), |v| cell(v, p.flatten(), f))
+            };
+            let rows: Vec<Vec<String>> = l
+                .modes
+                .iter()
+                .map(|row| {
+                    let p = pl.and_then(|p| p.modes.iter().find(|x| x.name == row.name));
+                    vec![
+                        row.name.clone(),
+                        cell(row.taste, p.map(|p| p.taste), Fmt::Dec(1)),
+                        cell(row.skip, p.map(|p| p.skip), Fmt::Pct),
+                        cell(row.new_to_you, p.map(|p| p.new_to_you), Fmt::Pct),
+                        cell(row.smooth, p.map(|p| p.smooth), Fmt::Dec(2)),
+                        cell(row.worst_hop, p.map(|p| p.worst_hop), Fmt::Dec(2)),
+                        cell(row.travel, p.map(|p| p.travel), Fmt::Dec(2)),
+                        opt(row.reached, p.map(|p| p.reached), Fmt::Pct),
+                        opt(row.picks_to_reach, p.map(|p| p.picks_to_reach), Fmt::Dec(1)),
+                    ]
+                })
+                .collect();
+            out.push_str(&table(
+                &[
+                    "mode",
+                    "taste",
+                    "skipped",
+                    "new to you",
+                    "smooth",
+                    "worst hop",
+                    "travel",
+                    "reached",
+                    "picks to get there",
+                ],
+                &rows,
+            ));
+        }
     }
 
     match &r.logged {

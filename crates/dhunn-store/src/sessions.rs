@@ -21,6 +21,8 @@ pub enum EventKind {
     Like,
     Dislike,
     Further,
+    /// "Surprise me" pressed mid-session.
+    Surprise,
     Back,
     Pause,
     Resume,
@@ -38,6 +40,7 @@ impl EventKind {
             EventKind::Like => "like",
             EventKind::Dislike => "dislike",
             EventKind::Further => "further",
+            EventKind::Surprise => "surprise",
             EventKind::Back => "back",
             EventKind::Pause => "pause",
             EventKind::Resume => "resume",

@@ -14,14 +14,43 @@ use crossterm::{
     terminal,
 };
 use dhunn_core::TrackId;
+use dhunn_index::places::Places;
 use dhunn_index::{AspectWeights, SoundSpace};
 use dhunn_profile::{
     Profile, ProfileConfig, Retainer, SkipModel, history_sessions, logged_sessions,
 };
-use dhunn_steer::{Feedback, Pick, Reason, Session, SessionConfig};
+use dhunn_steer::{Feedback, Goal, Leg, Mode, Pick, Reason, Session, SessionConfig};
 use dhunn_store::{EventKind, SessionId, Store, User};
 
 use crate::library::open;
+
+/// How a session is steered (shared by `dhunn session` and `dhunn play`).
+#[derive(Debug, Clone, clap::Args)]
+pub struct SteerArgs {
+    /// Start from these songs (search words; repeatable). Default: your most-played.
+    #[arg(long = "seed")]
+    pub seeds: Vec<String>,
+    #[arg(long, short)]
+    pub user: Option<String>,
+    /// Override the user's adventurousness (0..1) for this session.
+    #[arg(long)]
+    pub adventure: Option<f32>,
+    /// drift: wander gradually · usual: stay with what you play most · surprise: one big
+    /// hop somewhere you haven't explored · new: travel to music you've never played.
+    #[arg(long, value_enum, default_value_t = ModeArg::Drift)]
+    pub mode: ModeArg,
+    /// Travel toward this song or artist in small steps (search words).
+    #[arg(long)]
+    pub to: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ModeArg {
+    Drift,
+    Usual,
+    Surprise,
+    New,
+}
 
 /// Don't replay tracks heard in dhunn within this window.
 const RECENT_WINDOW_MS: i64 = 36 * 3600 * 1000;
@@ -171,13 +200,48 @@ pub(crate) fn know(
     Ok(Some(Known { profile, model }))
 }
 
+/// A destination from search words: an artist (the centre of their tracks) if the words
+/// name one, otherwise the best-matching track.
+fn destination(store: &Store, space: &SoundSpace, words: &str) -> Result<Mode> {
+    let wanted = dhunn_core::normalize_name(words);
+    let artists = store.primary_artists()?;
+    if let Some((id, label)) = store
+        .artists()?
+        .into_iter()
+        .find(|(_, n)| dhunn_core::normalize_name(n) == wanted)
+    {
+        let tracks: Vec<(TrackId, f32)> = artists
+            .iter()
+            .filter(|(_, a)| **a == id)
+            .map(|(&t, _)| (t, 1.0))
+            .collect();
+        if let Some(target) = space.centroid(&tracks) {
+            return Ok(Mode::Toward { target, label });
+        }
+    }
+    let t = find_track(store, space, words)?;
+    Ok(Mode::Toward {
+        target: space.vector(t).expect("found in space").to_vec(),
+        label: name(store, t),
+    })
+}
+
 fn session_config(
     store: &Store,
+    space: &SoundSpace,
     user: Option<&User>,
     known: Option<&Known>,
-    adventure: Option<f32>,
+    args: &SteerArgs,
     rng_seed: u64,
 ) -> Result<SessionConfig> {
+    let adventure = args.adventure;
+    let mode = match (&args.to, args.mode) {
+        (Some(words), _) => destination(store, space, words)?,
+        (None, ModeArg::Drift) => Mode::Drift,
+        (None, ModeArg::Usual) => Mode::Usual,
+        (None, ModeArg::Surprise) => Mode::Surprise,
+        (None, ModeArg::New) => Mode::New,
+    };
     let mut exclude = match user {
         Some(u) => store.recently_played(u.id, now_ms() - RECENT_WINDOW_MS)?,
         None => HashSet::new(),
@@ -192,6 +256,10 @@ fn session_config(
         artist_of: store.primary_artists()?,
         song_of: song_keys(store)?,
         taste: known.map(|k| k.profile.centroids()).unwrap_or_default(),
+        known: known
+            .map(|k| k.profile.tracks.keys().copied().collect())
+            .unwrap_or_default(),
+        mode,
         ..Default::default()
     })
 }
@@ -201,18 +269,49 @@ fn retainer<'a>(space: &'a SoundSpace, known: Option<&'a Known>) -> Option<Retai
     Some(Retainer::new(k.model.as_ref()?, space, &k.profile))
 }
 
-/// A session, with the skip model attached when there is one.
+/// A session, with the library map and (when there is one) the skip model attached.
 fn start<'a>(
     space: &'a SoundSpace,
+    places: &'a Places,
     seeds: &[TrackId],
     cfg: SessionConfig,
     retainer: Option<&'a Retainer<'a>>,
 ) -> Result<Session<'a>> {
-    let s = Session::new(space, seeds, cfg).context("seeds are not in the sound space")?;
+    let s = Session::new(space, seeds, cfg)
+        .context("seeds are not in the sound space")?
+        .with_places(places);
     Ok(match retainer {
         Some(r) => s.with_retention(r),
         None => s,
     })
+}
+
+/// Where a pick is on a journey, as text ("" when not on one).
+fn leg_text(l: Option<&Leg>) -> String {
+    let Some(l) = l else {
+        return String::new();
+    };
+    // Stop 0 is where the session started.
+    let stop = format!("stop {} of {}", l.step, l.of);
+    let arrived = l.step >= l.of;
+    match &l.goal {
+        Goal::Surprise if l.hop => {
+            "surprise: a jump to a part of your library you haven't explored".into()
+        }
+        Goal::New if arrived && l.first_here => "arrived: music you've never played".into(),
+        Goal::Destination(d) if arrived && l.first_here => format!("arrived near {d}"),
+        _ if arrived => String::new(),
+        Goal::New => format!("heading for music you've never played · {stop}"),
+        Goal::Destination(d) => format!("on the way to {d} · {stop}"),
+        Goal::Surprise => String::new(),
+    }
+}
+
+fn mode_line(sess: &Session) -> String {
+    match sess.mode() {
+        Mode::Toward { label, .. } => format!("toward {label}"),
+        m => m.name().to_owned(),
+    }
 }
 
 /// "· 82% likely you keep listening", when the skip model is attached.
@@ -265,21 +364,22 @@ pub fn similar(db: &Path, query: &str, n: usize) -> Result<()> {
     Ok(())
 }
 
-pub fn session(
-    db: &Path,
-    seeds: &[String],
-    user: Option<&str>,
-    len: usize,
-    adventure: Option<f32>,
-    rng_seed: u64,
-) -> Result<()> {
+pub fn session(db: &Path, args: &SteerArgs, len: usize, rng_seed: u64) -> Result<()> {
     let (store, space) = load(db)?;
-    let user = resolve_user(&store, user)?;
-    let seed_ids = resolve_seeds(&store, &space, seeds, user.as_ref())?;
+    let places = Places::build(&space);
+    let user = resolve_user(&store, args.user.as_deref())?;
+    let seed_ids = resolve_seeds(&store, &space, &args.seeds, user.as_ref())?;
     let known = know(&store, &space, user.as_ref())?;
-    let cfg = session_config(&store, user.as_ref(), known.as_ref(), adventure, rng_seed)?;
+    let cfg = session_config(
+        &store,
+        &space,
+        user.as_ref(),
+        known.as_ref(),
+        args,
+        rng_seed,
+    )?;
     let retainer = retainer(&space, known.as_ref());
-    let mut sess = start(&space, &seed_ids, cfg, retainer.as_ref())?;
+    let mut sess = start(&space, &places, &seed_ids, cfg, retainer.as_ref())?;
     println!(
         "Seeds: {}",
         seed_ids
@@ -288,7 +388,11 @@ pub fn session(
             .collect::<Vec<_>>()
             .join(", ")
     );
-    println!("Exploration {:.2}\n", sess.exploration());
+    println!(
+        "Mode {} · exploration {:.2}\n",
+        mode_line(&sess),
+        sess.exploration()
+    );
     for i in 1..=len {
         let Some(p) = sess.next_pick() else {
             println!("(library exhausted)");
@@ -306,6 +410,10 @@ fn print_pick(store: &Store, i: usize, p: &Pick) {
         name(store, p.track),
         facts(store, p.track)
     );
+    let leg = leg_text(p.leg.as_ref());
+    if !leg.is_empty() {
+        println!("     {leg}");
+    }
     if let Some(r) = &p.reason {
         println!("     {}{}", reason_text(store, r), keep_text(p));
     }
@@ -366,31 +474,26 @@ impl Player<'_> {
     }
 }
 
-pub struct PlayOptions<'a> {
-    pub seeds: &'a [String],
-    pub user: Option<&'a str>,
-    pub adventure: Option<f32>,
-    /// Non-interactive check: play this many seconds of a few tracks, then stop.
-    pub smoke: Option<u64>,
-}
-
-pub fn play(db: &Path, opts: PlayOptions<'_>) -> Result<()> {
-    if opts.smoke.is_none() && !std::io::stdin().is_terminal() {
+/// `smoke`: non-interactive check — play this many seconds of a few tracks, then stop.
+pub fn play(db: &Path, args: &SteerArgs, smoke: Option<u64>) -> Result<()> {
+    if smoke.is_none() && !std::io::stdin().is_terminal() {
         bail!("`dhunn play` needs an interactive terminal");
     }
     let (mut store, space) = load(db)?;
-    let user = resolve_user(&store, opts.user)?;
-    let seed_ids = resolve_seeds(&store, &space, opts.seeds, user.as_ref())?;
+    let places = Places::build(&space);
+    let user = resolve_user(&store, args.user.as_deref())?;
+    let seed_ids = resolve_seeds(&store, &space, &args.seeds, user.as_ref())?;
     let known = know(&store, &space, user.as_ref())?;
     let cfg = session_config(
         &store,
+        &space,
         user.as_ref(),
         known.as_ref(),
-        opts.adventure,
+        args,
         now_ms() as u64,
     )?;
     let retainer = retainer(&space, known.as_ref());
-    let mut sess = start(&space, &seed_ids, cfg, retainer.as_ref())?;
+    let mut sess = start(&space, &places, &seed_ids, cfg, retainer.as_ref())?;
 
     let mut device = rodio::DeviceSinkBuilder::open_default_sink()
         .context("opening the default audio output")?;
@@ -398,12 +501,13 @@ pub fn play(db: &Path, opts: PlayOptions<'_>) -> Result<()> {
     let params = serde_json::json!({
         "seeds": seed_ids.iter().map(|t| t.0).collect::<Vec<_>>(),
         "exploration": sess.exploration(),
+        "to": args.to,
     });
     // Automated audio checks are logged under their own mode so eval can ignore them.
-    let mode = if opts.smoke.is_some() {
+    let mode = if smoke.is_some() {
         "smoke"
     } else {
-        "drift"
+        sess.mode().name()
     };
     let session_id = store.start_session(user.as_ref().map(|u| u.id), mode, &params.to_string())?;
     let mut p = Player {
@@ -423,12 +527,12 @@ pub fn play(db: &Path, opts: PlayOptions<'_>) -> Result<()> {
             .join(", "),
         sess.exploration()
     );
-    if opts.smoke.is_none() {
+    if smoke.is_none() {
         println!(
-            "keys: space pause · n next · l like · d dislike · f further · b back · +/- volume · q quit\n"
+            "keys: space pause · n next · l like · d dislike · f further · b back · s surprise me · +/- volume · q quit\n"
         );
     }
-    let _raw = if opts.smoke.is_none() {
+    let _raw = if smoke.is_none() {
         Some(RawMode::on()?)
     } else {
         None
@@ -436,7 +540,7 @@ pub fn play(db: &Path, opts: PlayOptions<'_>) -> Result<()> {
 
     let mut played = 0;
     while let Some(pick) = sess.next_pick() {
-        if opts.smoke.is_some() && played >= 3 {
+        if smoke.is_some() && played >= 3 {
             break;
         }
         let t = pick.track;
@@ -465,6 +569,10 @@ pub fn play(db: &Path, opts: PlayOptions<'_>) -> Result<()> {
         played += 1;
         p.log(Some(t), EventKind::Play, Some(Duration::ZERO));
         line(&format!("▶ {}  [{}]", name(p.store, t), facts(p.store, t)));
+        let leg = leg_text(pick.leg.as_ref());
+        if !leg.is_empty() {
+            line(&format!("  {leg}"));
+        }
         if let Some(r) = &pick.reason {
             line(&format!(
                 "  {}{}",
@@ -473,7 +581,7 @@ pub fn play(db: &Path, opts: PlayOptions<'_>) -> Result<()> {
             ));
         }
 
-        let after = match opts.smoke {
+        let after = match smoke {
             Some(secs) => {
                 std::thread::sleep(Duration::from_secs(secs));
                 let pos = p.player.get_pos();
@@ -582,6 +690,11 @@ fn listen(
                     "  → going further (exploration {:.2})",
                     sess.exploration()
                 ));
+            }
+            KeyCode::Char('s') => {
+                p.log(Some(t), EventKind::Surprise, Some(pos));
+                sess.set_mode(Mode::Surprise);
+                line("  ✦ surprise coming up next");
             }
             KeyCode::Char('b') => {
                 p.log(Some(t), EventKind::Back, Some(pos));

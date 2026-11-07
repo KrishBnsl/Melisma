@@ -15,8 +15,9 @@ use std::collections::HashSet;
 use dhunn_core::TrackId;
 use dhunn_import::{spotify::ExtendedRow, time::parse_timestamp};
 use dhunn_index::SoundSpace;
+use dhunn_index::places::Places;
 use dhunn_profile::{Profile, ProfileConfig, Retainer, SkipModel, history_sessions};
-use dhunn_steer::{Feedback, Session, SessionConfig};
+use dhunn_steer::{Feedback, Mode, Session, SessionConfig};
 use dhunn_store::{MatchedPlay, Store};
 use serde::{Deserialize, Serialize};
 
@@ -69,12 +70,39 @@ pub struct SessionRow {
     pub same_artist: f64,
 }
 
+/// How each steering mode does (adventurousness 0.5, with the listener's profile).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModeRow {
+    pub name: String,
+    pub taste: f64,
+    pub skip: f64,
+    /// Share of picks the listener had never played before.
+    pub new_to_you: f64,
+    pub smooth: f64,
+    pub worst_hop: f64,
+    pub travel: f64,
+    /// Destinations only: share of sessions that got there (a pick among the
+    /// destination's 10 nearest tracks), and how many picks that took on average.
+    pub reached: Option<f64>,
+    pub picks_to_reach: Option<f64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ListenerReport {
     pub listeners: usize,
     pub sessions: usize,
     pub length: usize,
     pub rows: Vec<SessionRow>,
+    #[serde(default)]
+    pub modes: Vec<ModeRow>,
+}
+
+/// Where a session could travel: the library map, and a destination for "toward" runs.
+struct Trip<'a> {
+    places: &'a Places,
+    target: TrackId,
+    /// The destination's 10 nearest tracks: reaching any of them counts as arriving.
+    near_target: HashSet<TrackId>,
 }
 
 /// What steering knows about a listener: their profile (in `cfg.taste`) and skip model.
@@ -103,12 +131,24 @@ fn library_plays(rows: &[ExtendedRow]) -> Vec<MatchedPlay> {
         .collect()
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum Picker {
     Random,
     Nearest,
     /// Adventurousness, and whether the listener's profile and skip model are used.
     Steer(f32, bool),
+    /// A steering mode at adventurousness 0.5 with the profile.
+    Mode(ModeKind),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ModeKind {
+    Drift,
+    Usual,
+    Surprise,
+    New,
+    /// Toward a destination; `false` = head straight there instead of planning a route.
+    Toward(bool),
 }
 
 impl Picker {
@@ -118,6 +158,14 @@ impl Picker {
             Picker::Nearest => "nearest chain".into(),
             Picker::Steer(a, true) => format!("steer a={a:.1}"),
             Picker::Steer(a, false) => format!("steer a={a:.1}, no profile"),
+            Picker::Mode(m) => match m {
+                ModeKind::Drift => "drift".into(),
+                ModeKind::Usual => "usual".into(),
+                ModeKind::Surprise => "surprise".into(),
+                ModeKind::New => "something new".into(),
+                ModeKind::Toward(true) => "toward (route)".into(),
+                ModeKind::Toward(false) => "toward (straight)".into(),
+            },
         }
     }
 }
@@ -139,6 +187,10 @@ struct Acc {
     distinct: HashSet<TrackId>,
     /// Sum over listeners of distinct tracks.
     distinct_total: usize,
+    new_to_you: usize,
+    journeys: usize,
+    reached: usize,
+    reach_picks: usize,
 }
 
 /// Picks of one session under `picker`, with the listener's reactions fed back.
@@ -151,6 +203,7 @@ fn run_session(
     length: usize,
     base: &SessionConfig,
     known: &Known<'_>,
+    trip: &Trip<'_>,
     rng_seed: u64,
     acc: &mut Acc,
 ) {
@@ -175,8 +228,38 @@ fn run_session(
                 _ => s,
             }
         }
+        Picker::Mode(m) => {
+            let mode = match m {
+                ModeKind::Drift => Mode::Drift,
+                ModeKind::Usual => Mode::Usual,
+                ModeKind::Surprise => Mode::Surprise,
+                ModeKind::New => Mode::New,
+                ModeKind::Toward(_) => Mode::Toward {
+                    target: space
+                        .vector(trip.target)
+                        .expect("target from space")
+                        .to_vec(),
+                    label: "destination".into(),
+                },
+            };
+            let cfg = SessionConfig {
+                adventurousness: 0.5,
+                seed: rng_seed | 1,
+                mode,
+                plan_route: m != ModeKind::Toward(false),
+                ..known.cfg.clone()
+            };
+            let s = Session::new(space, &[seed_track], cfg).map(|s| s.with_places(trip.places));
+            match &known.retainer {
+                Some(r) => s.map(|s| s.with_retention(r)),
+                None => s,
+            }
+        }
         _ => None,
     };
+    let toward = matches!(picker, Picker::Mode(ModeKind::Toward(_)));
+    let mut reached_at: Option<usize> = None;
+    let first_pick = acc.picks;
     let mut prev = seed_track;
     let mut worst = f64::INFINITY;
     let mut last = None;
@@ -199,7 +282,7 @@ fn run_session(
                     .first()
                     .map(|x| x.0)
             }),
-            Picker::Steer(..) => session
+            Picker::Steer(..) | Picker::Mode(_) => session
                 .as_mut()
                 .and_then(|s| s.next_pick())
                 .map(|p| p.track),
@@ -243,8 +326,19 @@ fn run_session(
         acc.picks += 1;
         acc.taste += pct;
         acc.distinct.insert(t);
+        acc.new_to_you += usize::from(!known.cfg.known.contains(&t));
+        if toward && reached_at.is_none() && trip.near_target.contains(&t) {
+            reached_at = Some(acc.picks);
+        }
         prev = t;
         last = Some(t);
+    }
+    if toward {
+        acc.journeys += 1;
+        if let Some(at) = reached_at {
+            acc.reached += 1;
+            acc.reach_picks += at - first_pick + 1;
+        }
     }
     if let Some(l) = last {
         acc.sessions += 1;
@@ -261,6 +355,19 @@ pub fn simulated_listeners(
     let mut pickers = vec![Picker::Random, Picker::Nearest];
     pickers.extend(cfg.adventure_levels.iter().map(|&a| Picker::Steer(a, true)));
     pickers.push(Picker::Steer(0.5, false));
+    let main_rows = pickers.len();
+    pickers.extend(
+        [
+            ModeKind::Drift,
+            ModeKind::Usual,
+            ModeKind::Surprise,
+            ModeKind::New,
+            ModeKind::Toward(true),
+            ModeKind::Toward(false),
+        ]
+        .map(Picker::Mode),
+    );
+    let places = Places::build(space);
     let mut accs: Vec<Acc> = pickers.iter().map(|_| Acc::default()).collect();
 
     for l in 0..cfg.listeners {
@@ -293,6 +400,7 @@ pub fn simulated_listeners(
         let known = Known {
             cfg: SessionConfig {
                 taste: profile.centroids(),
+                known: profile.tracks.keys().copied().collect(),
                 ..cfg.steer.clone()
             },
             retainer: model.as_ref().map(|m| Retainer::new(m, space, &profile)),
@@ -308,9 +416,36 @@ pub fn simulated_listeners(
         for s in 0..cfg.sessions {
             let seed_track = *rng.pick(&favs);
             let run_seed = lseed.wrapping_mul(31).wrapping_add(s as u64 + 1);
+            // A destination: somewhere far from the start that the listener feels middling
+            // about (not a favourite, not hated).
+            let far: Vec<TrackId> = taste
+                .ids
+                .iter()
+                .zip(&taste.percentile)
+                .filter(|(t, p)| {
+                    (0.3..=0.7).contains(*p) && space.similarity(**t, seed_track) < 0.0
+                })
+                .map(|(t, _)| *t)
+                .collect();
+            let target = if far.is_empty() {
+                *rng.pick(space.ids())
+            } else {
+                *rng.pick(&far)
+            };
+            let tv = space.vector(target).expect("target from space").to_vec();
+            let trip = Trip {
+                places: &places,
+                target,
+                near_target: space
+                    .nearest(&tv, 10, |_| true)
+                    .into_iter()
+                    .map(|x| x.0)
+                    .collect(),
+            };
             for (p, acc) in pickers.iter().zip(&mut accs) {
                 run_session(
-                    space, &taste, *p, seed_track, cfg.length, &cfg.steer, &known, run_seed, acc,
+                    space, &taste, *p, seed_track, cfg.length, &cfg.steer, &known, &trip, run_seed,
+                    acc,
                 );
             }
         }
@@ -320,7 +455,28 @@ pub fn simulated_listeners(
         }
     }
 
-    let rows = pickers
+    let modes = pickers[main_rows..]
+        .iter()
+        .zip(&accs[main_rows..])
+        .map(|(p, a)| {
+            let picks = a.picks.max(1) as f64;
+            let sessions = a.sessions.max(1) as f64;
+            let toward = matches!(p, Picker::Mode(ModeKind::Toward(_)));
+            ModeRow {
+                name: p.name(),
+                taste: 100.0 * a.taste / picks,
+                skip: a.skips as f64 / picks,
+                new_to_you: a.new_to_you as f64 / picks,
+                smooth: a.hops / a.hop_n.max(1) as f64,
+                worst_hop: a.worst / sessions,
+                travel: a.travel / sessions,
+                reached: toward.then(|| a.reached as f64 / a.journeys.max(1) as f64),
+                picks_to_reach: (toward && a.reached > 0)
+                    .then(|| a.reach_picks as f64 / a.reached as f64),
+            }
+        })
+        .collect();
+    let rows = pickers[..main_rows]
         .iter()
         .zip(&accs)
         .map(|(p, a)| {
@@ -344,5 +500,6 @@ pub fn simulated_listeners(
         sessions: cfg.sessions,
         length: cfg.length,
         rows,
+        modes,
     })
 }

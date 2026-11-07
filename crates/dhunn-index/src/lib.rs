@@ -11,6 +11,8 @@
 //! Search is exact (brute force, parallel): at ≤ 500k tracks × ~134 dims that's a few
 //! milliseconds, and exact results are easier to reason about while tuning.
 
+pub mod places;
+
 use std::collections::HashMap;
 
 use dhunn_core::TrackId;

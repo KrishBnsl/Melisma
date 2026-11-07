@@ -141,6 +141,24 @@ fn eval_runs_on_simulated_history() {
         "{lis:?}"
     );
 
+    // Modes do what they say.
+    let m = |n: &str| lis.modes.iter().find(|r| r.name == n).unwrap();
+    assert_eq!(lis.modes.len(), 6);
+    assert!(m("usual").taste >= m("drift").taste, "{lis:?}");
+    assert!(
+        m("something new").new_to_you > m("drift").new_to_you,
+        "{lis:?}"
+    );
+    // A surprise makes one big jump and lands on unfamiliar music.
+    assert!(m("surprise").worst_hop < m("drift").worst_hop, "{lis:?}");
+    assert!(m("surprise").new_to_you > m("drift").new_to_you, "{lis:?}");
+    assert!(m("toward (route)").reached.unwrap() >= 0.5, "{lis:?}");
+    assert!(
+        m("toward (route)").worst_hop > m("toward (straight)").worst_hop,
+        "{lis:?}"
+    );
+    assert!(m("drift").reached.is_none());
+
     let report = Report {
         created_at: 0,
         label: None,
