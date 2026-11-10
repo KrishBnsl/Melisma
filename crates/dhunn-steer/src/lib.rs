@@ -207,6 +207,7 @@ pub struct Pick {
 }
 
 /// Deterministic xorshift for pick sampling.
+#[derive(Clone)]
 struct Rng(u64);
 
 impl Rng {
@@ -226,6 +227,7 @@ const FRIEND_NOTE: f32 = 0.2;
 /// Exploration in "your usual".
 const USUAL_EXPLORATION: f32 = 0.05;
 
+#[derive(Clone)]
 pub struct Session<'a> {
     space: &'a SoundSpace,
     cfg: SessionConfig,
@@ -680,6 +682,35 @@ impl<'a> Session<'a> {
         }
     }
 
+    /// Starts the session again from `track` (the song playing when you hand the choosing
+    /// to the session): what comes next is chosen near it, and explanations can point to it.
+    pub fn start_from(&mut self, track: TrackId) {
+        if !self.played.contains(&track) {
+            self.observe(track);
+        }
+        self.pull(track, 0.85);
+        if !self.positives.contains(&track) {
+            self.positives.push(track);
+        }
+    }
+
+    /// What would play over the next `n` picks if the listener heard everything through,
+    /// starting after `current` (if a song is playing). The session itself is unchanged;
+    /// as long as nothing else happens, the first forecast is exactly the next pick.
+    pub fn forecast(&self, current: Option<TrackId>, n: usize) -> Vec<Pick> {
+        let mut s = self.clone();
+        if let Some(t) = current {
+            s.feedback(t, Feedback::Finished);
+        }
+        let mut out = Vec::with_capacity(n);
+        while out.len() < n {
+            let Some(p) = s.next_pick() else { break };
+            s.feedback(p.track, Feedback::Finished);
+            out.push(p);
+        }
+        out
+    }
+
     /// Updates the session after the listener reacts to `track`.
     pub fn feedback(&mut self, track: TrackId, fb: Feedback) {
         match fb {
@@ -788,6 +819,40 @@ mod tests {
             sess.feedback(p.track, Feedback::Finished);
         }
         assert!(sess.next_pick().is_none(), "library exhausted");
+    }
+
+    #[test]
+    fn starting_from_a_song_picks_near_it() {
+        let s = ring();
+        let cfg = SessionConfig {
+            adventurousness: 0.0,
+            ..Default::default()
+        };
+        let mut sess = Session::new(&s, &[TrackId(1)], cfg).unwrap();
+        sess.start_from(TrackId(30));
+        let p = sess.next_pick().unwrap();
+        assert!(dist(p.track, TrackId(30)) <= 3, "{p:?}");
+        assert_ne!(p.track, TrackId(30), "the song itself was heard");
+    }
+
+    #[test]
+    fn forecast_matches_what_plays() {
+        let s = ring();
+        let mut sess = Session::new(&s, &[TrackId(1)], SessionConfig::default()).unwrap();
+        let first = sess.next_pick().unwrap();
+        let ahead: Vec<TrackId> = sess
+            .forecast(Some(first.track), 4)
+            .iter()
+            .map(|p| p.track)
+            .collect();
+        assert_eq!(ahead.len(), 4);
+        // Forecasting changed nothing: listening through plays exactly what was forecast.
+        sess.feedback(first.track, Feedback::Finished);
+        for want in ahead {
+            let p = sess.next_pick().unwrap();
+            assert_eq!(p.track, want);
+            sess.feedback(p.track, Feedback::Finished);
+        }
     }
 
     #[test]

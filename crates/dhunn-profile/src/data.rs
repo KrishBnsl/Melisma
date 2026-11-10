@@ -47,6 +47,13 @@ pub fn shared_sessions(sessions: &[LoggedSession]) -> Vec<Vec<Obs>> {
 }
 
 fn observations(sessions: &[LoggedSession], include_private: bool) -> Vec<Vec<Obs>> {
+    // Whether each track's latest like/unlike (in any session) was a like.
+    let mut likes: std::collections::HashMap<TrackId, bool> = Default::default();
+    for e in sessions.iter().flat_map(|s| &s.events) {
+        if let (Some(t), "like" | "unlike") = (e.track, e.kind.as_str()) {
+            likes.insert(t, e.kind == "like");
+        }
+    }
     let mut out = Vec::new();
     for s in sessions
         .iter()
@@ -61,6 +68,14 @@ fn observations(sessions: &[LoggedSession], include_private: bool) -> Vec<Vec<Ob
                     ts: s.started_at,
                     listened: true,
                     liked: false,
+                    disliked: false,
+                }),
+                // A like from another player's library (no play here): a strong yes.
+                "like" if !obs.iter().any(|o| o.track == track) => obs.push(Obs {
+                    track,
+                    ts: s.started_at,
+                    listened: true,
+                    liked: true,
                     disliked: false,
                 }),
                 kind => {
@@ -88,6 +103,12 @@ fn observations(sessions: &[LoggedSession], include_private: bool) -> Vec<Vec<Ob
                     .any(|e| e.track == Some(o.track) && e.kind == "skip")
             }
         });
+        // Likes taken back since don't count.
+        for o in &mut obs {
+            if o.liked && likes.get(&o.track) == Some(&false) {
+                o.liked = false;
+            }
+        }
         if !obs.is_empty() {
             out.push(obs);
         }
@@ -143,5 +164,32 @@ mod tests {
         assert!(o[0].listened && o[0].liked);
         assert!(!o[1].listened);
         assert!(o[2].listened, "a late skip still counts as a listen");
+    }
+
+    #[test]
+    fn likes_from_elsewhere_and_unlikes() {
+        let ev = |kind: &str, t: u64| LoggedEvent {
+            kind: kind.into(),
+            track: Some(TrackId(t)),
+            position_ms: None,
+        };
+        let s = |id, events| LoggedSession {
+            id,
+            started_at: 100,
+            mode: "drift".into(),
+            private: false,
+            events,
+        };
+        let got = logged_sessions(&[
+            s(1, vec![ev("play", 1), ev("like", 1), ev("like", 7)]),
+            s(2, vec![ev("unlike", 1)]),
+        ]);
+        let o = &got[0];
+        // Track 7 was liked without a play here; track 1's like was taken back later.
+        assert!(o.iter().any(|o| o.track == TrackId(7) && o.liked));
+        assert!(
+            o.iter()
+                .any(|o| o.track == TrackId(1) && !o.liked && o.listened)
+        );
     }
 }

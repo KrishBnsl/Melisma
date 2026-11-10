@@ -120,7 +120,7 @@ fn find_track(store: &Store, space: &SoundSpace, query: &str) -> Result<TrackId>
 }
 
 /// Seeds from queries; otherwise the user's most-listened tracks; otherwise a random track.
-fn resolve_seeds(
+pub(crate) fn resolve_seeds(
     store: &Store,
     space: &SoundSpace,
     queries: &[String],
@@ -154,16 +154,17 @@ pub(crate) fn name(store: &Store, t: TrackId) -> String {
     }
 }
 
-/// "92 BPM · A minor" from the stored feature summary.
-pub(crate) fn facts(store: &Store, t: TrackId) -> String {
-    let Some(json) = store
+fn summary(store: &Store, t: TrackId) -> Option<serde_json::Value> {
+    let json = store
         .track_summary(t, "dsp", dhunn_dsp::DSP_VERSION)
         .ok()
-        .flatten()
-    else {
-        return String::new();
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) else {
+        .flatten()?;
+    serde_json::from_str(&json).ok()
+}
+
+/// "92 BPM · A minor" from the stored feature summary.
+pub(crate) fn facts(store: &Store, t: TrackId) -> String {
+    let Some(v) = summary(store, t) else {
         return String::new();
     };
     let tempo = v["rhythm"]["tempo_bpm"]
@@ -177,7 +178,7 @@ pub(crate) fn facts(store: &Store, t: TrackId) -> String {
         .join(" · ")
 }
 
-fn reason_text(store: &Store, r: &Reason) -> String {
+pub(crate) fn reason_text(store: &Store, r: &Reason) -> String {
     let aspects: Vec<&str> = r
         .shared
         .iter()
@@ -214,9 +215,9 @@ pub(crate) fn know(
     Ok(Some(Known { profile, model }))
 }
 
-/// A destination from search words: an artist (the centre of their tracks) if the words
-/// name one, otherwise the best-matching track.
-fn destination(store: &Store, space: &SoundSpace, words: &str) -> Result<Mode> {
+/// A destination from search words: an artist or an album (the centre of its tracks) if
+/// the words name one, otherwise the best-matching track.
+pub(crate) fn destination(store: &Store, space: &SoundSpace, words: &str) -> Result<Mode> {
     let wanted = dhunn_core::normalize_name(words);
     let artists = store.primary_artists()?;
     if let Some((id, label)) = store
@@ -233,6 +234,24 @@ fn destination(store: &Store, space: &SoundSpace, words: &str) -> Result<Mode> {
             return Ok(Mode::Toward { target, label });
         }
     }
+    // An album whose name contains the words ("sonny boy" finds the soundtrack).
+    if wanted.chars().count() >= 3 {
+        let mut albums: std::collections::HashMap<String, Vec<(TrackId, f32)>> = Default::default();
+        for r in store.browse_rows()? {
+            if let Some(a) = r.album
+                && dhunn_core::normalize_name(&a).contains(&wanted)
+                && space.contains(r.track)
+            {
+                albums.entry(a).or_default().push((r.track, 1.0));
+            }
+        }
+        // The album with the most analyzed tracks, if several match.
+        if let Some((label, tracks)) = albums.into_iter().max_by_key(|(a, t)| (t.len(), a.clone()))
+            && let Some(target) = space.centroid(&tracks)
+        {
+            return Ok(Mode::Toward { target, label });
+        }
+    }
     let t = find_track(store, space, words)?;
     Ok(Mode::Toward {
         target: space.vector(t).expect("found in space").to_vec(),
@@ -245,7 +264,7 @@ const VIBE_TRACKS: usize = 10;
 
 /// A described sound as a destination: the centre of the tracks CLAP thinks match it best,
 /// with those matches (best first).
-fn vibe_target(space: &SoundSpace, text: &str) -> Result<(Mode, Vec<(TrackId, f32)>)> {
+pub(crate) fn vibe_target(space: &SoundSpace, text: &str) -> Result<(Mode, Vec<(TrackId, f32)>)> {
     if !space.has_clap() {
         bail!("vibe search needs learned embeddings: run `dhunn embed` first");
     }
@@ -294,7 +313,7 @@ pub(crate) fn session_friends(
     }
 }
 
-fn session_config(
+pub(crate) fn session_config(
     store: &Store,
     space: &SoundSpace,
     user: Option<&User>,
@@ -370,13 +389,16 @@ fn session_config(
     })
 }
 
-fn retainer<'a>(space: &'a SoundSpace, known: Option<&'a Known>) -> Option<Retainer<'a>> {
+pub(crate) fn retainer<'a>(
+    space: &'a SoundSpace,
+    known: Option<&'a Known>,
+) -> Option<Retainer<'a>> {
     let k = known?;
     Some(Retainer::new(k.model.as_ref()?, space, &k.profile))
 }
 
 /// A session, with the library map and (when there is one) the skip model attached.
-fn start<'a>(
+pub(crate) fn start<'a>(
     space: &'a SoundSpace,
     places: &'a Places,
     seeds: &[TrackId],
@@ -393,7 +415,7 @@ fn start<'a>(
 }
 
 /// Where a pick is on a journey, as text ("" when not on one).
-fn leg_text(l: Option<&Leg>) -> String {
+pub(crate) fn leg_text(l: Option<&Leg>) -> String {
     let Some(l) = l else {
         return String::new();
     };

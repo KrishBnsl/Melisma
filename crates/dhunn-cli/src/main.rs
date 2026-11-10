@@ -1,6 +1,7 @@
 //! `dhunn` — command-line front end for the dhunn recommendation engine.
 
 mod embed;
+mod engine;
 mod eval;
 mod friends;
 mod history;
@@ -119,6 +120,12 @@ enum Command {
         text: String,
         #[arg(short, default_value_t = 10)]
         n: usize,
+    },
+    /// Run the recommendation engine for another player (such as Elsewhere): JSON
+    /// requests on stdin, one reply per line on stdout.
+    Engine {
+        #[command(flatten)]
+        steer: listen::SteerArgs,
     },
     /// Print a planned session without playing it.
     Session {
@@ -276,6 +283,7 @@ fn main() -> Result<()> {
         ),
         Command::Vibe { text, n } => listen::vibe(&library::db_path(db)?, &text, n),
         Command::Similar { query, n } => listen::similar(&library::db_path(db)?, &query, n),
+        Command::Engine { steer } => engine::run(&library::db_path(db)?, &steer),
         Command::Session { steer, len, rng } => {
             listen::session(&library::db_path(db)?, &steer, len, rng)
         }

@@ -27,8 +27,15 @@ pub enum EventKind {
     Pause,
     Resume,
     Quit,
+    /// Jumped within the track (position = where to).
+    Seek,
     /// The file could not be played.
     Error,
+    /// The listener chose a different track themselves (position = where the current
+    /// one was left). Not a skip: it says nothing about the track that was playing.
+    Choose,
+    /// A like taken back.
+    Unlike,
 }
 
 impl EventKind {
@@ -45,7 +52,10 @@ impl EventKind {
             EventKind::Pause => "pause",
             EventKind::Resume => "resume",
             EventKind::Quit => "quit",
+            EventKind::Seek => "seek",
             EventKind::Error => "error",
+            EventKind::Choose => "choose",
+            EventKind::Unlike => "unlike",
         }
     }
 }
@@ -65,7 +75,44 @@ pub struct SearchHit {
     pub artist: Option<String>,
 }
 
+/// One library track with what a browser shows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BrowseRow {
+    pub track: TrackId,
+    pub title: String,
+    /// The first credited artist.
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub year: Option<i32>,
+    pub duration_s: f64,
+    pub path: Option<String>,
+}
+
 impl Store {
+    /// Every track with its first artist, album and newest file, for browsing.
+    pub fn browse_rows(&self) -> Result<Vec<BrowseRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.id, t.title, t.album, t.year, t.duration_s,
+                    (SELECT a.name FROM track_artists ta JOIN artists a ON a.id = ta.artist_id
+                     WHERE ta.track_id = t.id ORDER BY ta.position LIMIT 1),
+                    (SELECT f.path FROM track_files f WHERE f.track_id = t.id
+                     ORDER BY f.mtime_ns DESC LIMIT 1)
+             FROM tracks t ORDER BY t.id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(BrowseRow {
+                track: TrackId(r.get::<_, i64>(0)? as u64),
+                title: r.get(1)?,
+                album: r.get(2)?,
+                year: r.get(3)?,
+                duration_s: r.get(4)?,
+                artist: r.get(5)?,
+                path: r.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn start_session(
         &mut self,
         user: Option<UserId>,
@@ -149,6 +196,53 @@ impl Store {
                 |r| r.get(0),
             )
             .optional()?)
+    }
+
+    /// The track a file belongs to, by its path as analyzed.
+    pub fn track_by_path(&self, path: &str) -> Result<Option<TrackId>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT track_id FROM track_files WHERE path = ?1",
+                [path],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|id| TrackId(id as u64)))
+    }
+
+    /// Tracks a user likes now: liked, and not un-liked since.
+    pub fn liked_tracks(&self, user: UserId) -> Result<HashSet<TrackId>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT track_id, kind FROM events
+             WHERE user_id = ?1 AND kind IN ('like', 'unlike') AND track_id IS NOT NULL
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map([user.0 as i64], |r| {
+            Ok((TrackId(r.get::<_, i64>(0)? as u64), r.get::<_, String>(1)?))
+        })?;
+        let mut liked = HashSet::new();
+        for row in rows {
+            let (t, kind) = row?;
+            if kind == "like" {
+                liked.insert(t);
+            } else {
+                liked.remove(&t);
+            }
+        }
+        Ok(liked)
+    }
+
+    /// Every analyzed track's newest file path.
+    pub fn track_paths(&self) -> Result<Vec<(TrackId, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT track_id, path FROM track_files f
+             WHERE mtime_ns = (SELECT MAX(mtime_ns) FROM track_files g WHERE g.track_id = f.track_id)",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((TrackId(r.get::<_, i64>(0)? as u64), r.get::<_, String>(1)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// The stored human-readable feature summary (JSON) for a track.
@@ -283,9 +377,16 @@ mod tests {
             .unwrap();
         s.log_event(sess, Some(u), Some(t), EventKind::Skip, Some(4200), None)
             .unwrap();
+        s.log_event(sess, Some(u), Some(t), EventKind::Like, None, None)
+            .unwrap();
+        assert!(s.liked_tracks(u).unwrap().contains(&t));
+        s.log_event(sess, Some(u), Some(t), EventKind::Unlike, None, None)
+            .unwrap();
+        assert!(s.liked_tracks(u).unwrap().is_empty());
+        assert_eq!(s.track_paths().unwrap(), vec![(t, "/m/h1.mp3".to_owned())]);
         s.end_session(sess).unwrap();
         assert_eq!(
-            s.session_events(sess).unwrap(),
+            s.session_events(sess).unwrap()[..2],
             vec![("play".to_string(), Some(t)), ("skip".to_string(), Some(t))]
         );
         assert!(s.recently_played(u, 0).unwrap().contains(&t));
@@ -299,6 +400,8 @@ mod tests {
         let b = add(&mut s, "h2", "Let It Bleed", "The Rolling Stones");
         add(&mut s, "h3", "Paranoid", "Black Sabbath");
         assert_eq!(s.track_path(a).unwrap().as_deref(), Some("/m/h1.mp3"));
+        assert_eq!(s.track_by_path("/m/h1.mp3").unwrap(), Some(a));
+        assert_eq!(s.track_by_path("/m/nope.mp3").unwrap(), None);
         assert!(
             s.track_summary(a, "dsp", 1)
                 .unwrap()
@@ -312,5 +415,10 @@ mod tests {
         assert_eq!(hits.iter().map(|h| h.track).collect::<Vec<_>>(), vec![a, b]); // shorter title first
         assert_eq!(s.search_tracks("stones bleed", 5).unwrap()[0].track, b); // words in any field
         assert!(s.search_tracks("   ", 5).unwrap().is_empty());
+
+        let rows = s.browse_rows().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1].artist.as_deref(), Some("The Rolling Stones"));
+        assert_eq!(rows[1].path.as_deref(), Some("/m/h2.mp3"));
     }
 }

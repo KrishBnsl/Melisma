@@ -28,6 +28,11 @@ chosen.
   - `new`: travel to music you've never played;
   - `--to "<song or artist>"`: a planned route of small steps;
   - `--vibe "rainy night drive"`: travel toward a described sound.
+- **Works inside other players.** `dhunn engine` runs the recommender for another player,
+  which plays the music itself: JSON requests on stdin (`next`, `played`, `finished`,
+  `skip`, `like`, `further`, `mode`, `upcoming`, `profile`…), one reply per line on stdout.
+  The protocol is described at the top of `crates/dhunn-cli/src/engine.rs`. The
+  [Elsewhere](https://github.com/KrishBnsl/elsewhere) terminal player uses it for `/melisma`.
 - **Reacts as you listen.** Skips steer away; *further* and *back* change how far it wanders.
 - **Knows your friends** (if they opt in). Picks lean toward what friends love, with credit:
   "Aarav plays this a lot". `--friend <name>` travels into the part of a friend's taste you
@@ -77,6 +82,7 @@ No music files handy? A copy of the
 | `embed` | CLAP embeddings for analyzed tracks |
 | `import spotify\|apple <path> --user <name>` | Import a streaming history export and match it to your library |
 | `play` / `session` | Listen to, or print, a steered session (`--mode`, `--to`, `--vibe`, `--friend`, `--with`, `--adventure`, `--solo`, `--private`) |
+| `engine` | The recommender for another player (JSON lines on stdin and stdout) |
 | `similar "<song>"` | The closest-sounding tracks, and which aspects they share |
 | `vibe "<description>"` | The tracks that best match a description |
 | `profile` | Your taste regions and what the skip model has learned |
