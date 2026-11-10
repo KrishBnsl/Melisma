@@ -21,6 +21,9 @@ pub fn model_dir(explicit: Option<&Path>) -> PathBuf {
 
 pub fn load_clap(explicit: Option<&Path>) -> Result<Clap> {
     let dir = model_dir(explicit);
+    if explicit.is_none() && !dir.join("clap.json").exists() {
+        anyhow::bail!(crate::model::missing_help());
+    }
     Clap::load(&dir).with_context(|| format!("loading the CLAP model from {}", dir.display()))
 }
 
@@ -31,6 +34,9 @@ pub fn text_clap() -> Result<&'static Clap> {
         return Ok(c);
     }
     let dir = model_dir(None);
+    if !dir.join("clap.json").exists() {
+        anyhow::bail!(crate::model::missing_help());
+    }
     let c = Clap::load_text(&dir)
         .with_context(|| format!("loading the CLAP text model from {}", dir.display()))?;
     Ok(CLAP.get_or_init(|| c))

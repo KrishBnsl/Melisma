@@ -8,6 +8,7 @@ mod friends;
 mod history;
 mod library;
 mod listen;
+mod model;
 mod profile;
 
 use std::{
@@ -80,6 +81,11 @@ enum Command {
         force: bool,
         #[arg(short, long)]
         quiet: bool,
+    },
+    /// The CLAP model `embed` and vibe search use: where it is, and getting it.
+    Model {
+        #[command(subcommand)]
+        action: Option<ModelAction>,
     },
     /// Show what is in the library.
     Stats {
@@ -209,6 +215,19 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum ModelAction {
+    /// Download the ready-made model (about 790 MB) and check every file.
+    Download,
+    /// Install an export made with `uv run ml/export_clap.py --out <folder>`.
+    Install {
+        folder: PathBuf,
+        /// Link to the folder instead of copying it.
+        #[arg(long)]
+        link: bool,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum JudgeArg {
     Dsp,
@@ -242,6 +261,11 @@ fn main() -> Result<()> {
             force,
             quiet,
         } => embed::embed(&library::db_path(db)?, models.as_deref(), force, quiet),
+        Command::Model { action } => match action {
+            None => model::status(),
+            Some(ModelAction::Download) => model::download(),
+            Some(ModelAction::Install { folder, link }) => model::install(&folder, link),
+        },
         Command::Stats { failures } => library::stats(&library::db_path(db)?, failures),
         Command::User { action } => history::user(&library::db_path(db)?, action),
         Command::Import {

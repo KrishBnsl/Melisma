@@ -16,4 +16,14 @@ implementation. (The Hugging Face weights of `laion/larger_clap_music` are not u
 projection layers are untrained.)
 
 dhunn looks for the model in `$DHUNN_MODELS/clap`, then `<data dir>/dhunn/models/clap`
-(macOS: `~/Library/Application Support/dhunn/models/clap`), then `./models/clap`.
+(macOS: `~/Library/Application Support/dhunn/models/clap`, Linux: `~/.local/share/dhunn/models/clap`,
+Windows: `%APPDATA%\dhunn\models\clap`), then `./models/clap` (only from this folder).
+Put an export there so `dhunn embed` and vibe search work from anywhere:
+
+```bash
+dhunn model install models/clap --link   # or without --link to copy it
+dhunn model                              # where it is
+```
+
+`dhunn model download` fetches this same export, ready-made, and checks every file against the
+SHA-256 sums in `crates/dhunn-cli/src/model.rs`.

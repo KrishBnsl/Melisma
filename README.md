@@ -52,8 +52,9 @@ alias dhunn=./target/release/dhunn
 # 1. Analyze a folder of audio files (mp3, flac, wav, m4a/aac, ogg, aiff). Resumable.
 dhunn analyze ~/Music/library
 
-# 2. Optional but recommended: learned embeddings (≈ 2 tracks/s; needs the model, see below).
-uv run ml/export_clap.py --out models/clap
+# 2. Optional but recommended: learned embeddings (≈ 2 tracks/s). Get the CLAP model once
+#    (about 790 MB), or export it yourself and `dhunn model install <folder>` (see models/).
+dhunn model download
 dhunn embed
 
 # 3. Tell it who you are, and import your listening history.
@@ -80,6 +81,7 @@ No music files handy? A copy of the
 |---|---|
 | `analyze <dir>` | Scan and analyze new or changed tracks (by audio content, so renames and duplicates are free) |
 | `embed` | CLAP embeddings for analyzed tracks |
+| `model` | Where the CLAP model is; `model download` fetches it, `model install <folder> [--link]` puts your own export in place |
 | `import spotify\|apple <path> --user <name>` | Import a streaming history export and match it to your library |
 | `play` / `session` | Listen to, or print, a steered session (`--mode`, `--to`, `--vibe`, `--friend`, `--with`, `--adventure`, `--solo`, `--private`) |
 | `engine` | The recommender for another player (JSON lines on stdin and stdout) |
