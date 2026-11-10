@@ -1,5 +1,6 @@
 //! `dhunn` — command-line front end for the dhunn recommendation engine.
 
+mod audio;
 mod embed;
 mod engine;
 mod eval;
@@ -121,6 +122,10 @@ enum Command {
         #[arg(short, default_value_t = 10)]
         n: usize,
     },
+    /// Play audio for another program (Elsewhere on Linux and Windows): JSON requests on
+    /// stdin, one reply per line on stdout.
+    #[command(hide = true)]
+    Audio,
     /// Run the recommendation engine for another player (such as Elsewhere): JSON
     /// requests on stdin, one reply per line on stdout.
     Engine {
@@ -283,6 +288,7 @@ fn main() -> Result<()> {
         ),
         Command::Vibe { text, n } => listen::vibe(&library::db_path(db)?, &text, n),
         Command::Similar { query, n } => listen::similar(&library::db_path(db)?, &query, n),
+        Command::Audio => audio::run(),
         Command::Engine { steer } => engine::run(&library::db_path(db)?, &steer),
         Command::Session { steer, len, rng } => {
             listen::session(&library::db_path(db)?, &steer, len, rng)

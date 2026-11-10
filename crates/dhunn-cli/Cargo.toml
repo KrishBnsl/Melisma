@@ -25,7 +25,14 @@ dhunn-profile.workspace = true
 dhunn-steer.workspace = true
 dhunn-store.workspace = true
 dirs.workspace = true
+lofty.workspace = true
 rayon.workspace = true
+realfft.workspace = true
 rodio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+ureq.workspace = true
+
+[dev-dependencies]
+hound.workspace = true
+tempfile.workspace = true
