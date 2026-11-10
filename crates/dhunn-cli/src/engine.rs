@@ -24,6 +24,7 @@
 //! {"op":"library"}                   the paths of every song it knows
 //! {"op":"likes","paths":["…"]}       songs you like elsewhere (adds the ones it hasn't heard of)
 //! {"op":"unlike","path":"…"}         a like taken back
+//! {"op":"timecapsule"}              past favorites from the listener's imported history
 //! {"op":"profile"}                   what it has learned about you, as lines of text
 //! {"op":"quit","pos":…}              end the session (also on end of input)
 //! ```
@@ -186,6 +187,10 @@ impl Engine<'_> {
             "mode" => match self.set_mode(req) {
                 Ok(()) => json!({"ok": true, "mode": self.mode(),
                                  "exploration": self.sess.exploration()}),
+                Err(err) => json!({"ok": false, "error": err.to_string()}),
+            },
+            "timecapsule" => match self.timecapsule() {
+                Ok(songs) => json!({"ok": true, "songs": songs}),
                 Err(err) => json!({"ok": false, "error": err.to_string()}),
             },
             "library" => match self.store.track_paths() {
@@ -371,6 +376,30 @@ impl Engine<'_> {
         Ok(())
     }
 
+    fn timecapsule(&self) -> Result<Vec<Value>> {
+        let Some(user) = self.user else {
+            return Ok(Vec::new());
+        };
+        let cutoff = listen::now_ms() - 30 * 24 * 60 * 60 * 1000;
+        let recent = self.store.recently_played(user, cutoff)?;
+        let mut tracks = self.store.track_play_stats(user)?;
+        tracks.retain(|(track, plays, _, ts)| {
+            *plays > 0 && *ts <= cutoff / 1000 && !recent.contains(track)
+        });
+        tracks
+            .sort_unstable_by_key(|&(track, plays, _, ts)| (std::cmp::Reverse(plays), ts, track.0));
+        let mut songs = Vec::new();
+        for (track, plays, _, ts) in tracks {
+            if let Some(path) = self.store.track_path(track)? {
+                songs.push(json!({"path": path, "play_count": plays, "last_played": ts}));
+                if songs.len() == 20 {
+                    break;
+                }
+            }
+        }
+        Ok(songs)
+    }
+
     fn mode(&self) -> String {
         match self.sess.mode() {
             Mode::Toward { label, .. } => format!("toward {label}"),
@@ -443,6 +472,9 @@ impl Engine<'_> {
             "artist": row.as_ref().map(|r| r.artists.join(", ")),
             "album": row.as_ref().and_then(|r| r.album.clone()),
             "why": why,
+            "leg": pick.leg.as_ref().map(|leg| json!({
+                "step": leg.step, "of": leg.of, "hop": leg.hop
+            })),
             "facts": listen::facts(&self.store, t),
         }))
     }
