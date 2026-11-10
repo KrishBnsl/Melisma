@@ -37,3 +37,9 @@ ureq.workspace = true
 [dev-dependencies]
 hound.workspace = true
 tempfile.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+souvlaki = { version = "0.9.3", default-features = false, features = ["use_zbus"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }

@@ -12,6 +12,10 @@
 //! {"op":"pause"} {"op":"resume"} {"op":"stop"} {"op":"seek","to":s} {"op":"volume","volume":0.7}
 //! {"op":"spectrum","bands":24}         → {"bands":[0..1, …]} of what's playing
 //! {"op":"metadata","path":"…"}         → {"title","artist","album","album_artist","artwork"}
+//! {"op":"devices"}                     → available outputs
+//! {"op":"output","id":"…"}              → switch output and stop the old sink
+//! {"op":"prepare_next","path":"…","volume":0.7}  enqueue one gapless continuation
+//! {"op":"adopt_next"} / {"op":"cancel_next"}      commit or cancel that continuation
 //! {"op":"artwork","path":"…"}          → {"data": base64 of the embedded front cover}
 //! ```
 //!
@@ -19,10 +23,11 @@
 //! With `DHUNN_AUDIO_NULL=1` it plays to nowhere, in real time (for tests on machines without
 //! sound).
 
+use rodio::cpal::traits::{DeviceTrait, HostTrait};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicI8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI8, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -66,6 +71,9 @@ struct Shared {
 
 const RING: usize = 4096;
 const FFT: usize = 2048;
+const NEXT_WAITING: u8 = 0;
+const NEXT_STARTED: u8 = 1;
+const NEXT_CANCELLED: u8 = 2;
 
 /// Passes samples through unchanged and keeps a mono copy for the spectrum.
 struct Tap<S> {
@@ -74,23 +82,20 @@ struct Tap<S> {
     local: Vec<f32>,
     acc: f32,
     n: u16,
+    transition: Option<Arc<AtomicU8>>,
+    started: bool,
 }
 
 impl<S: Source> Tap<S> {
     fn new(inner: S, shared: Arc<Shared>) -> Self {
-        shared
-            .rate
-            .store(inner.sample_rate().get(), Ordering::Relaxed);
-        shared.heard.store(0, Ordering::Relaxed);
-        if let Ok(mut r) = shared.ring.lock() {
-            r.clear();
-        }
         Self {
             inner,
             shared,
             local: Vec::with_capacity(256),
             acc: 0.0,
             n: 0,
+            transition: None,
+            started: false,
         }
     }
 }
@@ -99,7 +104,35 @@ impl<S: Source> Iterator for Tap<S> {
     type Item = Sample;
 
     fn next(&mut self) -> Option<Sample> {
+        if self
+            .transition
+            .as_ref()
+            .is_some_and(|t| t.load(Ordering::Acquire) == NEXT_CANCELLED)
+        {
+            return None;
+        }
         let s = self.inner.next()?;
+        if !self.started {
+            if let Some(t) = &self.transition
+                && t.compare_exchange(
+                    NEXT_WAITING,
+                    NEXT_STARTED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                return None;
+            }
+            self.started = true;
+            self.shared
+                .rate
+                .store(self.inner.sample_rate().get(), Ordering::Relaxed);
+            self.shared.heard.store(0, Ordering::Relaxed);
+            if let Ok(mut r) = self.shared.ring.lock() {
+                r.clear();
+            }
+        }
         self.acc += s;
         self.n += 1;
         if self.n >= self.inner.channels().get() {
@@ -182,22 +215,65 @@ const CONNECTING: i8 = 0;
 const PLAYING: i8 = 1;
 const FAILED: i8 = -1;
 
+struct Prepared {
+    duration: Option<Duration>,
+    state: Arc<AtomicU8>,
+}
+impl Prepared {
+    fn started(&self) -> bool {
+        self.state.load(Ordering::Acquire) == NEXT_STARTED
+    }
+}
+
+fn local_decoder(path: &str) -> Result<(rodio::Decoder<BufReader<File>>, Option<Duration>)> {
+    let file = File::open(path).with_context(|| format!("can't open {path}"))?;
+    let len = file.metadata().map(|m| m.len()).ok();
+    let mut builder = rodio::Decoder::builder()
+        .with_data(BufReader::new(file))
+        .with_seekable(true)
+        .with_gapless(true);
+    if let Some(len) = len {
+        builder = builder.with_byte_len(len);
+    }
+    if let Some(ext) = Path::new(path).extension().and_then(|e| e.to_str()) {
+        builder = builder.with_hint(ext);
+    }
+    let decoder = builder.build().context("can't decode this file")?;
+    let duration = decoder.total_duration().or_else(|| {
+        lofty::read_from_path(path)
+            .ok()
+            .map(|f| f.properties().duration())
+    });
+    Ok((decoder, duration))
+}
+
 #[derive(Default)]
 struct Audio {
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    media: Option<crate::audio_media::DesktopMedia>,
     device: Option<rodio::MixerDeviceSink>,
+    output_id: Option<String>,
     /// The silent output, when there's no device on purpose.
     null: Option<rodio::mixer::Mixer>,
     player: Option<Arc<rodio::Player>>,
     shared: Arc<Shared>,
     duration: Option<Duration>,
+    prepared: Option<Prepared>,
     /// For a live stream: its status, and a counter that retires old connections.
     live: Option<Arc<AtomicI8>>,
     generation: Arc<AtomicU64>,
 }
 
 impl Audio {
+    fn cancel_next(&mut self) {
+        if let Some(next) = self.prepared.take() {
+            next.state.store(NEXT_CANCELLED, Ordering::Release);
+        }
+    }
+
     /// A fresh player on the sound device (opened the first time).
     fn fresh_player(&mut self, volume: f32) -> Result<Arc<rodio::Player>> {
+        self.cancel_next();
         if let Some(p) = self.player.take() {
             p.stop();
         }
@@ -226,31 +302,102 @@ impl Audio {
         let ok = json!({"ok": true});
         let volume = req["volume"].as_f64().unwrap_or(0.7) as f32;
         Ok(match req["op"].as_str().unwrap_or("") {
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            "media_start" => {
+                self.media = crate::audio_media::DesktopMedia::open();
+                json!({"ok": self.media.is_some(), "error": "desktop media controls unavailable"})
+            }
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            "media_stop" => {
+                self.media = None;
+                ok
+            }
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            "media_poll" => self.media.as_ref().map_or(ok, |media| media.poll()),
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            "media_update" => {
+                if let Some(media) = &mut self.media {
+                    media.update(req);
+                }
+                ok
+            }
+            "devices" => {
+                let host = rodio::cpal::default_host();
+                let current = self.output_id.clone().or_else(|| {
+                    host.default_output_device()?
+                        .id()
+                        .ok()
+                        .map(|id| id.to_string())
+                });
+                let devices: Vec<_> = host
+                    .output_devices()?
+                    .filter_map(|device| {
+                        let id = device.id().ok()?.to_string();
+                        let name = device.description().ok()?.name().to_owned();
+                        Some(json!({"current": current.as_ref() == Some(&id), "id": id, "name": name}))
+                    })
+                    .collect();
+                json!({"ok": true, "devices": devices})
+            }
+            "output" => {
+                let id = req["id"].as_str().context("output needs a device ID")?;
+                let host = rodio::cpal::default_host();
+                let device = host
+                    .output_devices()?
+                    .find(|device| device.id().is_ok_and(|found| found.to_string() == id))
+                    .context("output device is no longer available")?;
+                let mut sink = rodio::DeviceSinkBuilder::from_device(device)?.open_stream()?;
+                sink.log_on_drop(false);
+                self.cancel_next();
+                if let Some(player) = self.player.take() {
+                    player.stop();
+                }
+                self.generation.fetch_add(1, Ordering::SeqCst);
+                self.live = None;
+                self.device = Some(sink);
+                self.output_id = Some(id.to_owned());
+                ok
+            }
             "start" => {
                 let path = req["path"].as_str().context("start needs a path")?;
                 self.generation.fetch_add(1, Ordering::SeqCst);
                 self.live = None;
-                let file = File::open(path).with_context(|| format!("can't open {path}"))?;
-                let len = file.metadata().map(|m| m.len()).ok();
-                let mut builder = rodio::Decoder::builder()
-                    .with_data(BufReader::new(file))
-                    .with_seekable(true)
-                    .with_gapless(true);
-                if let Some(len) = len {
-                    builder = builder.with_byte_len(len);
-                }
-                if let Some(ext) = Path::new(path).extension().and_then(|e| e.to_str()) {
-                    builder = builder.with_hint(ext);
-                }
-                let decoder = builder.build().context("can't decode this file")?;
-                self.duration = decoder.total_duration().or_else(|| {
-                    lofty::read_from_path(path)
-                        .ok()
-                        .map(|f| f.properties().duration())
-                });
+                let (decoder, duration) = local_decoder(path)?;
+                self.duration = duration;
                 let player = self.fresh_player(volume)?;
                 player.append(Tap::new(decoder, self.shared.clone()));
                 player.play();
+                ok
+            }
+            "prepare_next" => {
+                anyhow::ensure!(
+                    self.prepared.is_none() && self.live.is_none(),
+                    "transition unavailable"
+                );
+                let player = self.player.as_ref().context("nothing playing")?;
+                // Both sources share the sink volume until the next source is adopted.
+                anyhow::ensure!(
+                    (volume - player.volume()).abs() < 0.001,
+                    "track volume changes"
+                );
+                let path = req["path"].as_str().context("prepare_next needs a path")?;
+                let (decoder, duration) = local_decoder(path)?;
+                let state = Arc::new(AtomicU8::new(NEXT_WAITING));
+                let mut tap = Tap::new(decoder, self.shared.clone());
+                tap.transition = Some(state.clone());
+                player.append(tap);
+                self.prepared = Some(Prepared { duration, state });
+                ok
+            }
+            "adopt_next" => {
+                let ready = self.prepared.as_ref().is_some_and(Prepared::started);
+                if ready && let Some(next) = self.prepared.take() {
+                    self.duration = next.duration;
+                }
+                json!({"ok": true, "adopted": ready})
+            }
+            "cancel_next" => {
+                self.cancel_next();
                 ok
             }
             "live" => {
@@ -303,6 +450,12 @@ impl Audio {
                 json!({"ok": true, "status": status})
             }
             "state" => {
+                if self.prepared.as_ref().is_some_and(Prepared::started) {
+                    let duration = self.duration.map_or(0.0, |d| d.as_secs_f64());
+                    return Ok(
+                        json!({"ok": true, "elapsed": duration, "duration": duration, "playing": false}),
+                    );
+                }
                 let (elapsed, playing) = match &self.player {
                     Some(p) => (p.get_pos().as_secs_f64(), !p.is_paused() && !p.empty()),
                     None => (0.0, false),
@@ -331,6 +484,7 @@ impl Audio {
                 json!({"ok": resumed, "error": if resumed { "" } else { "nothing to resume" }})
             }
             "stop" => {
+                self.cancel_next();
                 self.generation.fetch_add(1, Ordering::SeqCst);
                 if let Some(p) = self.player.take() {
                     p.stop();
@@ -498,6 +652,10 @@ fn metadata(path: &str) -> Value {
         "album": get(ItemKey::AlbumTitle),
         "album_artist": get(ItemKey::AlbumArtist),
         "artwork": artwork,
+        "disc": get(ItemKey::DiscNumber),
+        "number": get(ItemKey::TrackNumber),
+        "track_gain": get(ItemKey::ReplayGainTrackGain),
+        "album_gain": get(ItemKey::ReplayGainAlbumGain),
     })
 }
 
@@ -609,7 +767,23 @@ mod tests {
         assert_eq!(s["playing"], true);
         assert!((s["duration"].as_f64().unwrap() - 0.5).abs() < 0.05, "{s}");
         assert!(s["elapsed"].as_f64().unwrap() > 0.1, "{s}");
-        // The half-second tone ends.
+        a.handle(&json!({"op": "prepare_next", "path": p, "volume": 0.5}))
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !a.handle(&json!({"op": "adopt_next"})).unwrap()["adopted"]
+            .as_bool()
+            .unwrap()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "next source never started"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(a.handle(&json!({"op": "state"})).unwrap()["playing"], true);
+        a.handle(&json!({"op": "prepare_next", "path": p, "volume": 0.5}))
+            .unwrap();
+        a.handle(&json!({"op": "cancel_next"})).unwrap();
         std::thread::sleep(Duration::from_millis(600));
         assert_eq!(a.handle(&json!({"op": "state"})).unwrap()["playing"], false);
     }

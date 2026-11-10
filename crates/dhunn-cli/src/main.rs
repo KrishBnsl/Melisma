@@ -1,6 +1,8 @@
 //! `dhunn` — command-line front end for the dhunn recommendation engine.
 
 mod audio;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+mod audio_media;
 mod embed;
 mod engine;
 mod eval;
