@@ -318,6 +318,10 @@ impl<'a> Session<'a> {
 
     /// Switches mode mid-session (e.g. "surprise me" from the player); takes effect on the
     /// next pick.
+    pub fn set_friend_signal(&mut self, signal: HashMap<TrackId, (f32, u32)>) {
+        self.cfg.friend_signal = signal;
+    }
+
     pub fn set_mode(&mut self, mode: Mode) {
         self.cfg.mode = mode;
         self.journey = None;

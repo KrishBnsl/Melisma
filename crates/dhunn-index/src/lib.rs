@@ -117,6 +117,8 @@ pub struct SoundSpace {
     /// Z-scored DSP rows before weighting, for per-aspect comparisons (`zdims` wide).
     z: Vec<f32>,
     zdims: usize,
+    dsp_center: Vec<(f64, f64)>,
+    dsp_scale: Vec<f32>,
     /// Raw (unit) CLAP embeddings, for matching text — they share CLAP's text space.
     clap: HashMap<TrackId, Vec<f32>>,
     /// Share of similarity that comes from CLAP (0 = DSP only).
@@ -180,6 +182,7 @@ impl SoundSpace {
             z.extend_from_slice(v);
         }
         drop(rows);
+        let mut dsp_center = Vec::with_capacity(dims);
         for d in 0..dims {
             let mean = (0..n).map(|i| z[i * dims + d] as f64).sum::<f64>() / n.max(1) as f64;
             let var = (0..n)
@@ -187,6 +190,7 @@ impl SoundSpace {
                 .sum::<f64>()
                 / n.max(1) as f64;
             let sd = if var.sqrt() > 1e-9 { var.sqrt() } else { 1.0 };
+            dsp_center.push((mean, sd));
             for i in 0..n {
                 let v = ((z[i * dims + d] as f64 - mean) / sd) as f32;
                 z[i * dims + d] = v.clamp(-Z_CLIP, Z_CLIP);
@@ -242,6 +246,8 @@ impl SoundSpace {
             unit,
             z,
             zdims: dims,
+            dsp_center,
+            dsp_scale: scale,
             clap: HashMap::new(),
             clap_share: 0.0,
             aspects,
@@ -327,6 +333,45 @@ impl SoundSpace {
         v.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         v.truncate(k);
         v
+    }
+
+    /// Find local tracks closest to a portable, unnormalized DSP descriptor.
+    pub fn nearest_raw_dsp(&self, raw: &[f32], n: usize) -> Vec<(TrackId, f32)> {
+        if raw.len() != self.zdims
+            || self.zdims == 0
+            || n == 0
+            || raw.iter().any(|v| !v.is_finite())
+        {
+            return Vec::new();
+        }
+        let query: Vec<f32> = raw
+            .iter()
+            .zip(&self.dsp_center)
+            .map(|(&x, &(mean, sd))| (((x as f64 - mean) / sd) as f32).clamp(-Z_CLIP, Z_CLIP))
+            .collect();
+        let scale = dot(&self.dsp_scale, &self.dsp_scale).max(1e-6);
+        let mut ranked: Vec<_> = self
+            .ids
+            .iter()
+            .zip(self.z.chunks_exact(self.zdims))
+            .map(|(&track, row)| {
+                let squared = row
+                    .iter()
+                    .zip(&query)
+                    .zip(&self.dsp_scale)
+                    .map(|((&x, &y), &w)| ((x - y) * w).powi(2))
+                    .sum::<f32>();
+                (track, 1.0 / (1.0 + (squared / scale).sqrt()))
+            })
+            .collect();
+        let order =
+            |a: &(TrackId, f32), b: &(TrackId, f32)| b.1.total_cmp(&a.1).then(a.0.0.cmp(&b.0.0));
+        if ranked.len() > n {
+            ranked.select_nth_unstable_by(n, order);
+            ranked.truncate(n);
+        }
+        ranked.sort_unstable_by(order);
+        ranked
     }
 
     /// Builds the space from the store's current DSP features, without learned embeddings.

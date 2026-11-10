@@ -598,6 +598,23 @@ impl Store {
         }))
     }
 
+    pub fn track_features(
+        &self,
+        track: TrackId,
+        kind: &str,
+        version: u32,
+    ) -> Result<Option<Vec<f32>>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT vec FROM features WHERE track_id = ?1 AND kind = ?2 AND version = ?3",
+                params![track.0 as i64, kind, version],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(|blob| blob_to_vec(&blob)))
+    }
+
     /// All stored vectors of one kind/version, with their dimension names.
     pub fn feature_matrix(&self, kind: &str, version: u32) -> Result<FeatureMatrix> {
         let names: Option<String> = self

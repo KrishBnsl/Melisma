@@ -21,6 +21,8 @@
 //! {"op":"from","path":"…"}           start choosing from this song (the one playing)
 //! {"op":"mode","mode":"usual"}       drift, usual, new or surprise; or
 //!   {"op":"mode","to":"…"} / {"op":"mode","vibe":"…"} / {"op":"mode","friend":"…"}
+//! {"op":"recording","path":"…"}     decoded audio hash of a local track
+//! {"op":"locate","hash":"…"}         local paths for that decoded audio hash
 //! {"op":"library"}                   the paths of every song it knows
 //! {"op":"likes","paths":["…"]}       songs you like elsewhere (adds the ones it hasn't heard of)
 //! {"op":"unlike","path":"…"}         a like taken back
@@ -54,6 +56,8 @@ struct Engine<'a> {
     known: Option<&'a listen::Known>,
     listener: Option<User>,
     friends: Vec<Friend>,
+    remote: Vec<(String, TrackId)>,
+    solo: bool,
     session: SessionId,
     user: Option<dhunn_core::UserId>,
     who: String,
@@ -100,6 +104,8 @@ pub fn run(db: &Path, args: &SteerArgs) -> Result<()> {
         known: known.as_ref(),
         listener: user.clone(),
         friends,
+        remote: Vec::new(),
+        solo: args.solo,
         session,
         user: user.as_ref().map(|u| u.id),
         who: user
@@ -189,8 +195,29 @@ impl Engine<'_> {
                                  "exploration": self.sess.exploration()}),
                 Err(err) => json!({"ok": false, "error": err.to_string()}),
             },
+            "taste-export" => match self.taste_export() {
+                Ok(taste) => json!({"ok":true, "taste":taste}),
+                Err(err) => json!({"ok":false, "error":err.to_string()}),
+            },
+            "taste-import" => {
+                self.taste_import(req["tastes"].as_array().map_or(&[][..], |v| v.as_slice()));
+                ok
+            }
             "timecapsule" => match self.timecapsule() {
                 Ok(songs) => json!({"ok": true, "songs": songs}),
+                Err(err) => json!({"ok": false, "error": err.to_string()}),
+            },
+            "recording" => match target.and_then(|t| self.store.recording_hash(t).ok().flatten()) {
+                Some(hash) => json!({"ok": true, "hash": hash,
+                    "duration_ms": target.and_then(|t| self.store.track(t).ok().flatten())
+                        .map(|row| (row.duration_s * 1000.0) as u64).unwrap_or_default()}),
+                None => json!({"ok": false, "error": "Melisma has not analyzed this track"}),
+            },
+            "locate" => match self
+                .store
+                .recording_paths(req["hash"].as_str().unwrap_or(""))
+            {
+                Ok(paths) => json!({"ok": true, "paths": paths}),
                 Err(err) => json!({"ok": false, "error": err.to_string()}),
             },
             "library" => match self.store.track_paths() {
@@ -356,12 +383,24 @@ impl Engine<'_> {
         } else if let Some(text) = req["vibe"].as_str() {
             listen::vibe_target(self.space, text)?.0
         } else if let Some(who) = req["friend"].as_str() {
-            let f = crate::friends::find_friend(&self.store, &self.friends, who)?;
-            let me = self.known.map(|k| k.profile.clone()).unwrap_or_default();
-            Mode::Toward {
-                target: dhunn_profile::beyond_me(&me, &f.profile)
-                    .ok_or_else(|| anyhow::anyhow!("{} has no taste profile yet", f.name))?,
-                label: format!("{}'s taste", f.name),
+            let name = dhunn_core::normalize_name(who);
+            if let Some((name, track)) = self
+                .remote
+                .iter()
+                .find(|(n, _)| dhunn_core::normalize_name(n) == name)
+            {
+                Mode::Toward {
+                    target: self.space.vector(*track).unwrap_or_default().to_vec(),
+                    label: format!("{name}'s taste"),
+                }
+            } else {
+                let f = crate::friends::find_friend(&self.store, &self.friends, who)?;
+                let me = self.known.map(|k| k.profile.clone()).unwrap_or_default();
+                Mode::Toward {
+                    target: dhunn_profile::beyond_me(&me, &f.profile)
+                        .ok_or_else(|| anyhow::anyhow!("{} has no taste profile yet", f.name))?,
+                    label: format!("{}'s taste", f.name),
+                }
             }
         } else {
             match req["mode"].as_str().unwrap_or("") {
@@ -374,6 +413,106 @@ impl Engine<'_> {
         };
         self.sess.set_mode(mode);
         Ok(())
+    }
+
+    fn taste_export(&self) -> Result<Value> {
+        let mut regions = Vec::new();
+        if let Some(user) = &self.listener {
+            let sessions = crate::friends::sessions_of(&self.store, user, false)?;
+            let profile = crate::friends::profile_from(&self.store, self.space, &sessions)?;
+            for region in profile.regions.iter().take(3) {
+                if let Some(sound) = self.taste_mean(&region.top)? {
+                    regions.push(json!({"weight":region.share, "sound":sound}));
+                }
+            }
+            if regions.is_empty() {
+                let mut weighted: Vec<_> = profile
+                    .weight
+                    .into_iter()
+                    .filter(|(_, weight)| *weight > 0.0)
+                    .collect();
+                weighted.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.0.cmp(&b.0.0)));
+                let tracks: Vec<_> = weighted
+                    .into_iter()
+                    .take(5)
+                    .map(|(track, _)| track)
+                    .collect();
+                if let Some(sound) = self.taste_mean(&tracks)? {
+                    regions.push(json!({"weight":1.0, "sound":sound}));
+                }
+            }
+        }
+        Ok(json!({"version":dhunn_dsp::DSP_VERSION, "regions":regions}))
+    }
+
+    fn taste_mean(&self, tracks: &[TrackId]) -> Result<Option<Vec<f32>>> {
+        let mut samples = Vec::new();
+        for &track in tracks {
+            if let Some(row) = self
+                .store
+                .track_features(track, "dsp", dhunn_dsp::DSP_VERSION)?
+            {
+                samples.push(row);
+            }
+        }
+        // Publish aggregates only. Sparse histories stay on the device.
+        if samples.len() < 3 {
+            return Ok(None);
+        }
+        let mut mean = vec![0.0; samples[0].len()];
+        for row in &samples {
+            for (sum, value) in mean.iter_mut().zip(row) {
+                *sum += value / samples.len() as f32;
+            }
+        }
+        Ok(Some(mean))
+    }
+
+    fn taste_import(&mut self, cards: &[Value]) {
+        let mut signal = dhunn_profile::friend_signal(&self.friends);
+        self.remote.clear();
+        for card in cards.iter().take(99) {
+            let Some(name) = card["name"].as_str().filter(|n| !n.is_empty()) else {
+                continue;
+            };
+            let taste = &card["taste"];
+            if taste["version"].as_u64() != Some(dhunn_dsp::DSP_VERSION as u64) {
+                continue;
+            }
+            let Some(regions) = taste["regions"].as_array() else {
+                continue;
+            };
+            let mut matches = Vec::new();
+            for region in regions.iter().take(3) {
+                let Ok(raw) = serde_json::from_value::<Vec<f32>>(region["sound"].clone()) else {
+                    continue;
+                };
+                let weight = region["weight"]
+                    .as_f64()
+                    .unwrap_or_default()
+                    .clamp(0.0, 1.0) as f32;
+                for (track, similarity) in self.space.nearest_raw_dsp(&raw, 4) {
+                    if weight > 0.0 && similarity >= 0.45 {
+                        matches.push((track, similarity * (0.40 + 0.20 * weight)));
+                    }
+                }
+            }
+            if let Some(&(target, _)) = matches.iter().max_by(|a, b| a.1.total_cmp(&b.1)) {
+                let who = (self.friends.len() + self.remote.len()) as u32;
+                self.remote.push((name.to_owned(), target));
+                for (track, strength) in matches {
+                    let prior = signal.entry(track).or_insert((0.0, who));
+                    if strength > prior.0 {
+                        *prior = (strength, who);
+                    }
+                }
+            }
+        }
+        self.sess.set_friend_signal(if self.solo {
+            Default::default()
+        } else {
+            signal
+        });
     }
 
     fn timecapsule(&self) -> Result<Vec<Value>> {
@@ -456,10 +595,15 @@ impl Engine<'_> {
         if !leg.is_empty() {
             why.push(leg);
         }
-        if let Some(f) = pick
-            .friend
-            .and_then(|(w, s)| crate::friends::friend_text(&self.friends, w, s))
-        {
+        if let Some(f) = pick.friend.and_then(|(w, s)| {
+            if (w as usize) < self.friends.len() {
+                crate::friends::friend_text(&self.friends, w, s)
+            } else {
+                self.remote
+                    .get(w as usize - self.friends.len())
+                    .map(|(name, _)| format!("Close to {name}'s taste"))
+            }
+        }) {
             why.push(f);
         }
         if let Some(k) = pick.keep {

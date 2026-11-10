@@ -198,6 +198,27 @@ impl Store {
             .optional()?)
     }
 
+    /// A portable identifier for the decoded audio, independent of paths and tags.
+    pub fn recording_hash(&self, track: TrackId) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT content_hash FROM tracks WHERE id = ?1",
+                [track.0 as i64],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn recording_paths(&self, hash: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.path FROM track_files f JOIN tracks t ON f.track_id = t.id
+             WHERE t.content_hash = ?1 ORDER BY f.mtime_ns DESC, f.path LIMIT 32",
+        )?;
+        let rows = stmt.query_map([hash], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// The track a file belongs to, by its path as analyzed.
     pub fn track_by_path(&self, path: &str) -> Result<Option<TrackId>> {
         Ok(self
